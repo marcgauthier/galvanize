@@ -25,7 +25,12 @@ cleanup() {
   local pid
   for pid in "${cleanup_pids[@]:-}"; do
     kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${cleanup_pids[@]:-}"; do
     wait "$pid" 2>/dev/null || true
+  done
+  for pid in "${cleanup_pids[@]:-}"; do
+    kill -9 "$pid" 2>/dev/null || true
   done
   if (( status != 0 )) && [[ -n $active_runtime && -d $active_runtime ]]; then
     local failed="$root/tests-live/failures/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$active_runtime")"
@@ -96,6 +101,7 @@ stop_last_node() {
   local i=$((${#cleanup_pids[@]} - 1))
   kill "${cleanup_pids[$i]}" 2>/dev/null || true
   wait "${cleanup_pids[$i]}" 2>/dev/null || true
+  kill -9 "${cleanup_pids[$i]}" 2>/dev/null || true
   unset 'cleanup_pids[$i]'
 }
 
@@ -103,7 +109,12 @@ stop_all_nodes() {
   local pid
   for pid in "${cleanup_pids[@]:-}"; do
     kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${cleanup_pids[@]:-}"; do
     wait "$pid" 2>/dev/null || true
+  done
+  for pid in "${cleanup_pids[@]:-}"; do
+    kill -9 "$pid" 2>/dev/null || true
   done
   cleanup_pids=()
 }
@@ -541,7 +552,15 @@ EOF
   echo "  CHECK  High cluster (2 nodes) converged with identical live_records (sha256=$high1_live_hash)"
   echo "  CHECK  High cluster high_records remained intact and uncorrupted (sha256=$high1_sec_hash)"
 
-  # 3. Test update and delete propagation from Low across Air-Gap while High data remains unaffected
+  # 3. Check Low vs High (cross-domain comparison for Low-originated values only)
+  local high1_low_hash high2_low_hash
+  high1_low_hash=$(psql "postgresql://postgres@127.0.0.1:54941/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records WHERE source LIKE 'low-%' ORDER BY id" | sha256sum | awk '{print $1}')
+  high2_low_hash=$(psql "postgresql://postgres@127.0.0.1:54942/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records WHERE source LIKE 'low-%' ORDER BY id" | sha256sum | awk '{print $1}')
+
+  [[ $low1_hash == "$high1_low_hash" && $high1_low_hash == "$high2_low_hash" ]] || { echo "Low data on High does not match Low cluster data" >&2; return 1; }
+  echo "  CHECK  Low data replicated across air-gap to High matches Low cluster data exactly (sha256=$low1_hash)"
+
+  # 4. Test update and delete propagation from Low across Air-Gap while High data remains unaffected
   echo "  WRITE  updating id=11 (Low-1) and deleting id=12 (Low-2) on node LOW-1 and LOW-2"
   psql "postgresql://postgres@127.0.0.1:54931/postgres" -v ON_ERROR_STOP=1 -qc "UPDATE live_records SET value = 'val-low-1-updated' WHERE id = 11;"
   psql "postgresql://postgres@127.0.0.1:54932/postgres" -v ON_ERROR_STOP=1 -qc "DELETE FROM live_records WHERE id = 12;"
