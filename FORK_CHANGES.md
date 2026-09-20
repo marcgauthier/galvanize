@@ -68,5 +68,5 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **High/Low Faults:** 3-node air-gap resiliency test verifying deterministic rejection of corrupted payloads (MAC/digest failures) and forged Ed25519 manifest signatures, replay attack idempotency, and out-of-order sequence gap holding and healing across the High cluster mesh.
 - **High/Low Schema Evolution:** 3-node air-gap schema drift test validating safe `waiting-schema` hold on the High receiver when Low evolves schema first, followed by zero-downtime hot schema reload (`corrosion reload`) and automatic backlog ingestion across all mesh peers.
 - **Large Payload & Bulk Batches:** 3-node cluster stress test validating 1,000-row atomic bulk batch transactions, multi-megabyte binary blob payloads (1.5 MB), Zstd level-15 compression/decompression, and 8 KiB chunked QUIC stream replication to bit-identical state across all mesh peers.
-
+- **Two-Node Benchmark:** Manual `tests-live/benchmark` scenario drives fully acknowledged 100-mutation PostgreSQL-wire transactions on one encrypted node for a configurable duration, measures convergence to a SHA-256-identical peer, and reports workload, replication-drain, and total logical protocol byte rates from Prometheus counters.
 

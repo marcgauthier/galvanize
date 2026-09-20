@@ -19,10 +19,13 @@ crash_write_seconds=${GALVANIZE_LIVE_CRASH_WRITE_SECONDS:-15}
 crash_settle_seconds=${GALVANIZE_LIVE_CRASH_SETTLE_SECONDS:-30}
 contention_write_seconds=${GALVANIZE_LIVE_CONTENTION_WRITE_SECONDS:-15}
 contention_settle_seconds=${GALVANIZE_LIVE_CONTENTION_SETTLE_SECONDS:-25}
+benchmark_write_seconds=${GALVANIZE_LIVE_BENCHMARK_WRITE_SECONDS:-30}
+benchmark_sync_timeout_seconds=${GALVANIZE_LIVE_BENCHMARK_SYNC_TIMEOUT_SECONDS:-120}
 started_at=$SECONDS
 
 [[ -x "$binary" ]] || { echo "build first: cargo build -p corrosion" >&2; exit 2; }
 command -v psql >/dev/null || { echo "psql is required for live tests" >&2; exit 2; }
+command -v curl >/dev/null || { echo "curl is required for the live-test metrics checks" >&2; exit 2; }
 
 cleanup_pids=()
 declare -A named_pids=()
@@ -247,6 +250,68 @@ wait_contention_node() {
     sleep 0.2
   done
   echo "  READY  pg=127.0.0.1:$port schema=contention_records"
+}
+
+wait_benchmark_node() {
+  local pg_port=$1 metrics_port=$2 deadline=$((SECONDS + timeout_seconds))
+  wait_pg "$pg_port"
+  until psql "postgresql://postgres@127.0.0.1:$pg_port/postgres" -Atqc 'SELECT count(*) FROM benchmark_records' >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || { echo "benchmark schema was not ready on $pg_port" >&2; return 1; }
+    sleep 0.2
+  done
+  until curl -fsS "http://127.0.0.1:$metrics_port/metrics" >/dev/null; do
+    (( SECONDS < deadline )) || { echo "Prometheus listener $metrics_port did not become ready" >&2; return 1; }
+    sleep 0.2
+  done
+  echo "  READY  pg=127.0.0.1:$pg_port metrics=127.0.0.1:$metrics_port"
+}
+
+start_benchmark_node() {
+  local node=$1 gossip=$2 pg=$3 metrics=$4 bootstrap=$5 key=$6
+  local label=${node##*/node-}
+  mkdir -p "$node/schema" "$node/logs"
+  echo "  START  node ${label^^}  pg=$pg gossip=$gossip metrics=$metrics"
+  cat >"$node/schema/benchmark.sql" <<'SQL'
+CREATE TABLE IF NOT EXISTS benchmark_records (
+  id INTEGER PRIMARY KEY NOT NULL,
+  value TEXT NOT NULL DEFAULT '',
+  revision INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+SQL
+  cat >"$node/config.toml" <<EOF
+[db]
+path = "$node/corrosion.db"
+schema_paths = ["$node/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "$pg"
+[gossip]
+addr = "$gossip"
+client_addr_v4 = "${gossip%:*}:0"
+bootstrap = $bootstrap
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[telemetry.prometheus]
+bind_addr = "$metrics"
+[log]
+format = "json"
+EOF
+  GALVANIZE_DB_KEY="$key" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+    "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+}
+
+benchmark_tx_bytes() {
+  local metrics_port=$1
+  curl -fsS "http://127.0.0.1:$metrics_port/metrics" |
+    awk '$1 ~ /^corro_transport_tx_bytes_v2_total(\{|$)/ { total += $2 } END { printf "%.0f\n", total + 0 }'
 }
 
 stop_last_node() {
@@ -2127,6 +2192,160 @@ sys.stdout.write('COMMIT;\n')
   finish "$runtime" 0
 }
 
+benchmark() {
+  local runtime="$runtime_root/benchmark"
+  local pg_a=55081 pg_b=55082 metrics_a=56081 metrics_b=56082
+  local gossip_a=127.0.0.81:48081 gossip_b=127.0.0.82:48082
+  local write_started_ns write_finished_ns sync_started_ns sync_finished_ns
+  local baseline_bytes bytes_after_writes bytes_after_sync
+  local transactions inserts updates mutations write_elapsed sync_elapsed total_elapsed
+  local expected_rows count_a count_b hash_a hash_b deadline
+
+  rm -rf "$runtime"; mkdir -p "$runtime"; active_runtime=$runtime
+  echo "== benchmark: two-node sustained write and convergence measurement =="
+  echo "  PLAN      Node A commits 50 inserts + 50 updates per transaction for ${benchmark_write_seconds}s"
+  echo "  TOPOLOGY  encrypted Node A <-> encrypted Node B; PostgreSQL wire application writes"
+
+  start_benchmark_node "$runtime/node-a" "$gossip_a" "127.0.0.1:$pg_a" "127.0.0.1:$metrics_a" "[\"$gossip_b\"]" 'galv-benchmark-a'
+  start_benchmark_node "$runtime/node-b" "$gossip_b" "127.0.0.1:$pg_b" "127.0.0.1:$metrics_b" "[\"$gossip_a\"]" 'galv-benchmark-b'
+  wait_benchmark_node "$pg_a" "$metrics_a"
+  wait_benchmark_node "$pg_b" "$metrics_b"
+
+  echo "  SEED     creating 50 hot rows for the update half of each transaction"
+  python3 - "postgresql://postgres@127.0.0.1:$pg_a/postgres" <<'PY' | psql "postgresql://postgres@127.0.0.1:$pg_a/postgres" -v ON_ERROR_STOP=1 -q >/dev/null
+import sys
+payload = 'seed:' + ('x' * 251)
+print('BEGIN;')
+for row_id in range(1, 51):
+    print(f"INSERT INTO benchmark_records (id, value, revision) VALUES ({row_id}, '{payload}', 0);")
+print('COMMIT;')
+PY
+
+  echo "  PAUSE    allowing baseline replication and telemetry counters to settle"
+  sleep 2
+  baseline_bytes=$(( $(benchmark_tx_bytes "$metrics_a") + $(benchmark_tx_bytes "$metrics_b") ))
+  write_started_ns=$(date +%s%N)
+  echo "  WRITE    committing fully acknowledged 100-mutation transactions for ${benchmark_write_seconds}s"
+  local workload_output
+  workload_output=$(python3 - "postgresql://postgres@127.0.0.1:$pg_a/postgres" "$benchmark_write_seconds" <<'PY'
+import subprocess
+import sys
+import time
+
+url = sys.argv[1]
+duration = float(sys.argv[2])
+payload_size = 256
+process = subprocess.Popen(
+    ['psql', url, '-v', 'ON_ERROR_STOP=1', '-qAt'],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=True,
+    bufsize=1,
+)
+
+def payload(prefix, transaction, row):
+    value = f'{prefix}:{transaction}:{row}:'
+    return value + ('x' * (payload_size - len(value)))
+
+started = time.monotonic()
+transactions = 0
+next_id = 51
+try:
+    while time.monotonic() - started < duration:
+        transactions += 1
+        marker = f'benchmark-commit-{transactions}'
+        statements = ['BEGIN;']
+        for row in range(50):
+            statements.append(
+                "INSERT INTO benchmark_records (id, value, revision) "
+                f"VALUES ({next_id}, '{payload('insert', transactions, row)}', {transactions});"
+            )
+            next_id += 1
+        for row_id in range(1, 51):
+            statements.append(
+                "UPDATE benchmark_records "
+                f"SET value = '{payload('update', transactions, row_id)}', revision = {transactions} "
+                f"WHERE id = {row_id};"
+            )
+        statements.extend(['COMMIT;', f"SELECT '{marker}';"])
+        process.stdin.write('\n'.join(statements) + '\n')
+        process.stdin.flush()
+        while True:
+            response = process.stdout.readline()
+            if response == '':
+                raise RuntimeError('psql exited before acknowledging a benchmark transaction')
+            if response.strip() == marker:
+                break
+finally:
+    process.stdin.close()
+    exit_code = process.wait()
+    if exit_code:
+        raise SystemExit(exit_code)
+
+elapsed = time.monotonic() - started
+print(f'transactions={transactions}')
+print(f'inserts={transactions * 50}')
+print(f'updates={transactions * 50}')
+print(f'mutations={transactions * 100}')
+print(f'elapsed_seconds={elapsed:.6f}')
+PY
+)
+  write_finished_ns=$(date +%s%N)
+  transactions=$(awk -F= '/^transactions=/{print $2}' <<<"$workload_output")
+  inserts=$(awk -F= '/^inserts=/{print $2}' <<<"$workload_output")
+  updates=$(awk -F= '/^updates=/{print $2}' <<<"$workload_output")
+  mutations=$(awk -F= '/^mutations=/{print $2}' <<<"$workload_output")
+  write_elapsed=$(awk -F= '/^elapsed_seconds=/{print $2}' <<<"$workload_output")
+  [[ -n "$transactions" && "$transactions" -gt 0 ]] || { echo "benchmark completed no transactions" >&2; return 1; }
+  [[ "$inserts" -eq $((transactions * 50)) && "$updates" -eq $((transactions * 50)) && "$mutations" -eq $((transactions * 100)) ]] || { echo "benchmark mutation accounting mismatch" >&2; return 1; }
+
+  bytes_after_writes=$(( $(benchmark_tx_bytes "$metrics_a") + $(benchmark_tx_bytes "$metrics_b") ))
+  expected_rows=$((50 + inserts))
+  count_a=$(psql "postgresql://postgres@127.0.0.1:$pg_a/postgres" -Atqc 'SELECT count(*) FROM benchmark_records')
+  hash_a=$(psql "postgresql://postgres@127.0.0.1:$pg_a/postgres" -Atqc "SELECT id || ':' || value || ':' || revision FROM benchmark_records ORDER BY id" | sha256sum | awk '{print $1}')
+  [[ "$count_a" == "$expected_rows" ]] || { echo "Node A row count mismatch; expected $expected_rows, got $count_a" >&2; return 1; }
+
+  sync_started_ns=$(date +%s%N)
+  deadline=$((SECONDS + benchmark_sync_timeout_seconds))
+  echo "  SYNC     waiting up to ${benchmark_sync_timeout_seconds}s for Node B to match $expected_rows rows"
+  while (( SECONDS < deadline )); do
+    count_b=$(psql "postgresql://postgres@127.0.0.1:$pg_b/postgres" -Atqc 'SELECT count(*) FROM benchmark_records' 2>/dev/null || echo 0)
+    if [[ "$count_b" == "$expected_rows" ]]; then
+      hash_b=$(psql "postgresql://postgres@127.0.0.1:$pg_b/postgres" -Atqc "SELECT id || ':' || value || ':' || revision FROM benchmark_records ORDER BY id" | sha256sum | awk '{print $1}')
+      [[ "$hash_b" == "$hash_a" ]] && break
+    fi
+    sleep 0.1
+  done
+  sync_finished_ns=$(date +%s%N)
+  count_b=$(psql "postgresql://postgres@127.0.0.1:$pg_b/postgres" -Atqc 'SELECT count(*) FROM benchmark_records')
+  hash_b=$(psql "postgresql://postgres@127.0.0.1:$pg_b/postgres" -Atqc "SELECT id || ':' || value || ':' || revision FROM benchmark_records ORDER BY id" | sha256sum | awk '{print $1}')
+  [[ "$count_b" == "$expected_rows" && "$hash_b" == "$hash_a" ]] || { echo "Node B did not converge within ${benchmark_sync_timeout_seconds}s" >&2; return 1; }
+
+  bytes_after_sync=$(( $(benchmark_tx_bytes "$metrics_a") + $(benchmark_tx_bytes "$metrics_b") ))
+  sync_elapsed=$(awk -v start="$sync_started_ns" -v end="$sync_finished_ns" 'BEGIN { printf "%.6f", (end - start) / 1000000000 }')
+  total_elapsed=$(awk -v start="$write_started_ns" -v end="$sync_finished_ns" 'BEGIN { printf "%.6f", (end - start) / 1000000000 }')
+  local workload_bytes=$((bytes_after_writes - baseline_bytes))
+  local drain_bytes=$((bytes_after_sync - bytes_after_writes))
+  local total_bytes=$((bytes_after_sync - baseline_bytes))
+  local transaction_rate mutation_rate workload_bandwidth drain_bandwidth total_bandwidth
+  transaction_rate=$(awk -v value="$transactions" -v seconds="$write_elapsed" 'BEGIN { printf "%.2f", value / seconds }')
+  mutation_rate=$(awk -v value="$mutations" -v seconds="$write_elapsed" 'BEGIN { printf "%.2f", value / seconds }')
+  workload_bandwidth=$(awk -v value="$workload_bytes" -v seconds="$write_elapsed" 'BEGIN { printf "%.2f", value / seconds }')
+  drain_bandwidth=$(awk -v value="$drain_bytes" -v seconds="$sync_elapsed" 'BEGIN { printf "%.2f", value / seconds }')
+  total_bandwidth=$(awk -v value="$total_bytes" -v seconds="$total_elapsed" 'BEGIN { printf "%.2f", value / seconds }')
+
+  echo "  STATS    write_seconds=$write_elapsed transactions=$transactions transactions_per_second=$transaction_rate"
+  echo "  STATS    inserts=$inserts updates=$updates total_mutations=$mutations mutations_per_second=$mutation_rate"
+  echo "  STATS    sync_seconds=$sync_elapsed total_seconds=$total_elapsed"
+  echo "  STATS    node_a_rows=$count_a node_a_sha256=$hash_a"
+  echo "  STATS    node_b_rows=$count_b node_b_sha256=$hash_b"
+  echo "  NETWORK  logical_protocol_bytes workload=$workload_bytes drain=$drain_bytes total=$total_bytes"
+  echo "  NETWORK  logical_protocol_bytes_per_second workload=$workload_bandwidth drain=$drain_bandwidth total=$total_bandwidth"
+  echo "  NOTE     logical protocol bytes are aggregate outbound GALVANIZE sync, broadcast, and gossip payloads from both nodes; they exclude PostgreSQL client traffic and QUIC/IP wire overhead."
+  echo "  CHECK    Node B converged to an identical application-data hash"
+  finish "$runtime" 0
+}
+
 case "$scenario" in
   encryption) encryption ;;
   rekey) rekey ;;
@@ -2138,8 +2357,7 @@ case "$scenario" in
   highlow-faults) highlow_faults ;;
   highlow-schema) highlow_schema ;;
   large-payload) large_payload ;;
+  benchmark) benchmark ;;
   all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; highlow_faults; highlow_schema; large_payload ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|highlow-schema|large-payload|all}" >&2; exit 2 ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|highlow-schema|large-payload|benchmark|all}" >&2; exit 2 ;;
 esac
-
-
