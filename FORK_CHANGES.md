@@ -39,13 +39,13 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **Crate:** `crates/galv-highlow` (Galvanize-specific; no Vaultmesh wire compatibility).
 - **Format:** `galvanize-highlow/1` bundles are zstd-compressed (level 15), encrypted with a random XChaCha20-Poly1305 content key, RSA-OAEP (SHA-256) wrapped for the High receiver, and accompanied by an Ed25519-signed manifest. Payloads use `.zstd.galvh`; manifests use `.json.galv`.
 - **Transport Adapters:** Supports `directory` (local filesystem/USB staging), `http`/`https` (POST artifacts / GET manifests), `ftp`/`ftps`, and `sftp`.
-- **Low-side Change Capture:** Intercepts committing local transactions in `crates/corro-types/src/change.rs` (`insert_local_changes`) and replicated mesh transactions in `crates/corro-agent/src/agent/util.rs` (`handle_changes`, `process_fully_buffered_changes`), appending ordered row delta events across the entire Low cluster to `__galv_highlow_events`.
+- **Low-side Change Capture:** Automatically intercepts committing local user transactions in `crates/corro-types/src/change.rs` (`insert_local_changes`) and appends ordered row delta events to `__galv_highlow_events`.
 - **Low-side Exporter Background Task:** `spawn_highlow_exporter` in `crates/corro-agent/src/agent/highlow.rs` packages pending events, seals bundles, publishes them on `upload_interval_seconds`, and marks outbox uploaded.
-- **High-side Ingestion & Merge:** `spawn_highlow_receiver` in `crates/corro-agent/src/agent/highlow.rs` polls for manifests on `download_interval_seconds`, downloads payloads, authenticates signatures and digests, decrypts bundles, records to `__galv_highlow_inbox`, applies row upserts/deletes via `galv_highlow::apply::apply_bundle`, and broadcasts local changes to High cluster peers.
+- **High-side Ingestion & Merge:** `spawn_highlow_receiver` in `crates/corro-agent/src/agent/highlow.rs` polls for manifests on `download_interval_seconds`, downloads payloads, authenticates signatures and digests, decrypts bundles, records to `__galv_highlow_inbox`, and applies row upserts/deletes via `galv_highlow::apply::apply_bundle`.
 - **Safety boundaries:** artifact names cannot escape the selected transport directory; manifest/payload/decompressed sizes are bounded; hashes and signatures are verified before ingestion; schema hash mismatch is held as `waiting-schema`; SFTP configuration requires a SHA-256 host-key pin; endpoints cannot contain credentials.
 - **Durability:** internal `__galv_highlow_*` SQLite tables hold the Low event journal/outbox and High inbox/stream state. Receipt is idempotent and a missing sequence is recoverable rather than permanently quarantined.
 - **Agent lifecycle change:** when enabled, `corro-agent` creates that local journal before CR-SQLite initialization so bookkeeping tables are not enrolled as mesh-replicated user tables.
-- **Configuration:** Corrosion has a disabled-by-default `[highlow]` block. Enabling it requires exactly one role: `[highlow.low]`, `[highlow.high]`, or `[highlow.high-replica]`. Low and High require `[highlow.transport]`; secrets are environment-variable names, never inline credentials.
+- **Configuration:** Corrosion has a disabled-by-default `[highlow]` block. Enabling it requires exactly one role: `[highlow.low]`, `[highlow.high]`, or `[highlow.high-replica]`. Low and High require `[highlow.transport]`; secrets are environment-variable names, never ihttps://superfly.github.io/corrosion/nline credentials.
 
 ### 6. Gossip Allow-List Replication Control
 - **Configuration:** `[gossip.allow-list]` (or `allow_list`).
@@ -58,8 +58,9 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
   - Discovery filtering in `spawn_swim_announcer`.
 
 ### 7. Live PostgreSQL-Wire Node Tests
-- **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|partition|all}` after `cargo build -p corrosion`.
+- **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|all}` after `cargo build -p corrosion`.
 - **Behavior:** each scenario creates isolated `node-*` folders, starts real Galvanize agents, and makes all application SQL requests through PostgreSQL wire listeners using `psql`.
 - **Retention:** successful runtime directories are removed. Failed runs are moved to `tests-live/failures/` with encrypted databases and agent logs for diagnosis.
-- **High/Low:** the runner executes a full 5-minute ($300\text{s}$) 5-node scenario (3 Low nodes mesh with 1 gateway exporter $\rightarrow$ air-gap staging $\rightarrow$ 2 High nodes mesh with 1 gateway receiver). It validates continuous concurrent PostgreSQL writes from all nodes, one-way air-gap transfer, mesh convergence, High-side data non-overwriting/preservation, and mutation propagation.
-- **Partition:** 4-node cluster split-brain test ({A, B} vs {C, D}) testing concurrent partitioned writes, intra-partition isolation and replication, network partition healing, and automatic anti-entropy bi-stream reconciliation to identical SHA-256 state across all 4 nodes.
+- **High/Low:** the runner executes the full end-to-end `highlow` scenario verifying Low node PostgreSQL writes, air-gap artifact packaging, RSA-OAEP/Ed25519 signing/encryption, directory staging transport, and High node background ingestion/updates/deletes.
+- **Partition:** 4-node split-brain test ({A, B} vs {C, D}) verifying strict intra-partition isolation, concurrent partitioned writes, network healing, and anti-entropy bi-stream reconciliation to identical SHA-256 state across all nodes.
+- **Crash Recovery:** 3-node cluster crash-recovery test executing ungraceful `kill -9` mid-transaction bursts, rolling crashes of Nodes B and C, SQLite3MC encrypted WAL recovery, and anti-entropy reconciliation to identical SHA-256 database state across all nodes.

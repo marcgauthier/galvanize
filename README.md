@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="galvanize_logo.png" alt="GALVANIZE Database logo" width="500">
+</p>
+
 # GALVANIZE
 
 GALVANIZE is a security-focused fork of [Corrosion](https://github.com/superfly/corrosion): a gossip-based, distributed SQLite database for large systems. It retains Corrosion's eventually consistent, local-first data model while adding encryption at rest, controlled peer replication, and one-way cross-domain replication.
@@ -56,7 +60,7 @@ The `corrosion` CLI provides administration and database access. The executable 
 - Optionally set `[gossip.allow-list]` to allowed peer IP addresses and CIDRs; its default is `["*"]`.
 - Configure `[highlow]` with exactly one role (`low`, `high`, or `high-replica`) to enable cross-domain transfer.
 
-The upstream [Corrosion documentation](https://superfly.github.io/corrosion/) remains useful for the base API, schema, and agent configuration. GALVANIZE-specific changes and operational details are tracked in [GALVANIZE.md](GALVANIZE.md).
+The upstream [Corrosion documentation](https://superfly.github.io/corrosion/) remains useful for the base API, schema, and agent configuration. GALVANIZE-specific changes and operational details are tracked in [FORK_CHANGES.md](FORK_CHANGES.md).
 
 ## Building GALVANIZE
 

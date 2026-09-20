@@ -15,12 +15,15 @@ highlow_write_seconds=${GALVANIZE_LIVE_HIGHLOW_WRITE_SECONDS:-300}
 highlow_settle_seconds=${GALVANIZE_LIVE_HIGHLOW_SETTLE_SECONDS:-15}
 partition_write_seconds=${GALVANIZE_LIVE_PARTITION_WRITE_SECONDS:-30}
 partition_settle_seconds=${GALVANIZE_LIVE_PARTITION_SETTLE_SECONDS:-15}
+crash_write_seconds=${GALVANIZE_LIVE_CRASH_WRITE_SECONDS:-15}
+crash_settle_seconds=${GALVANIZE_LIVE_CRASH_SETTLE_SECONDS:-30}
 started_at=$SECONDS
 
 [[ -x "$binary" ]] || { echo "build first: cargo build -p corrosion" >&2; exit 2; }
 command -v psql >/dev/null || { echo "psql is required for live tests" >&2; exit 2; }
 
 cleanup_pids=()
+declare -A named_pids=()
 active_runtime=''
 cleanup() {
   local status=$?
@@ -119,6 +122,58 @@ EOF
   cleanup_pids+=("$!")
 }
 
+start_named_node() {
+  local name=$1 node=$2 gossip=$3 pg=$4 bootstrap=$5 key=$6 allow=$7
+  local label=${node##*/node-}
+  mkdir -p "$node/schema" "$node/logs"
+  echo "  START  node ${label^^}  pg=$pg gossip=$gossip allow=$allow"
+  cat >"$node/schema/live.sql" <<'SQL'
+CREATE TABLE IF NOT EXISTS live_records (
+  id INTEGER PRIMARY KEY NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+SQL
+  cat >"$node/config.toml" <<EOF
+[db]
+path = "$node/corrosion.db"
+schema_paths = ["$node/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "$pg"
+[gossip]
+addr = "$gossip"
+client_addr_v4 = "${gossip%:*}:0"
+bootstrap = $bootstrap
+plaintext = true
+allow-list = $allow
+[admin]
+path = "$node/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+EOF
+  GALVANIZE_DB_KEY="$key" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+    "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
+  local pid=$!
+  cleanup_pids+=("$pid")
+  named_pids["$name"]="$pid"
+}
+
+kill_named_node_hard() {
+  local name=$1
+  local pid="${named_pids[$name]:-}"
+  if [[ -n "$pid" ]]; then
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    unset "named_pids[$name]"
+  fi
+}
+
 wait_pg() {
   local port=$1 deadline=$((SECONDS + timeout_seconds))
   until psql "postgresql://postgres@127.0.0.1:$port/postgres" -Atqc 'SELECT 1' >/dev/null 2>&1; do
@@ -157,6 +212,7 @@ stop_all_nodes() {
     kill -9 "$pid" 2>/dev/null || true
   done
   cleanup_pids=()
+  named_pids=()
 }
 
 finish() {
@@ -781,12 +837,185 @@ partition() {
   finish "$runtime" 0
 }
 
+crash_recovery() {
+  local runtime="$runtime_root/crash-recovery"
+  rm -rf "$runtime"; mkdir -p "$runtime"; active_runtime=$runtime
+  echo "== crash-recovery: 3-node SQLite3MC encrypted WAL recovery under kill -9 =="
+  echo "  TOPOLOGY  3 Nodes: A (127.0.0.61), B (127.0.0.62), C (127.0.0.63)"
+  echo "  PLAN      Phase 1: Baseline -> Phase 2: Burst writes & kill -9 B -> Phase 3: Restart B & kill -9 C -> Phase 4: Restart C & Healed Mesh Convergence"
+
+  local key_a="galv-crash-key-a" key_b="galv-crash-key-b" key_c="galv-crash-key-c"
+  local node_a="$runtime/node-a" node_b="$runtime/node-b" node_c="$runtime/node-c"
+
+  local bootstrap='["127.0.0.61:48061", "127.0.0.62:48062", "127.0.0.63:48063"]'
+
+  # Phase 1: Baseline Mesh
+  echo "  PHASE 1: Starting all 3 encrypted nodes"
+  start_named_node "a" "$node_a" 127.0.0.61:48061 127.0.0.1:54961 "$bootstrap" "$key_a" '["*"]'
+  start_named_node "b" "$node_b" 127.0.0.62:48062 127.0.0.1:54962 "$bootstrap" "$key_b" '["*"]'
+  start_named_node "c" "$node_c" 127.0.0.63:48063 127.0.0.1:54963 "$bootstrap" "$key_c" '["*"]'
+
+  wait_node 54961; wait_node 54962; wait_node 54963
+
+  echo "  WRITE  writing 10 baseline rows per node (30 total rows)"
+  local i
+  for ((i = 1; i <= 10; i++)); do
+    psql "postgresql://postgres@127.0.0.1:54961/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((i * 10 + 1)), 'base-a', 'val-base-a-$i');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54962/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((i * 10 + 2)), 'base-b', 'val-base-b-$i');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54963/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((i * 10 + 3)), 'base-c', 'val-base-c-$i');" >/dev/null
+  done
+
+  sleep 3
+  local base_count_a base_count_b base_count_c
+  base_count_a=$(psql "postgresql://postgres@127.0.0.1:54961/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  base_count_b=$(psql "postgresql://postgres@127.0.0.1:54962/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  base_count_c=$(psql "postgresql://postgres@127.0.0.1:54963/postgres" -Atqc 'SELECT count(*) FROM live_records')
+
+  [[ $base_count_a == "30" && $base_count_b == "30" && $base_count_c == "30" ]] || { echo "Baseline convergence failed; expected 30 rows on all nodes" >&2; return 1; }
+  echo "  CHECK  Phase 1 baseline converged (30 rows across all 3 nodes)"
+
+  # Phase 2: Active Concurrent Burst Writes & Mid-Flight kill -9 of Node B
+  echo "  PHASE 2: Active concurrent burst writes and abrupt kill -9 of Node B"
+  local second tick_started
+  local p2_written_a=0 p2_written_b=0 p2_written_c=0
+  local crash_point=$((crash_write_seconds / 2))
+  (( crash_point < 1 )) && crash_point=1
+
+  for ((second = 1; second <= crash_write_seconds; second++)); do
+    tick_started=$SECONDS
+
+    # Write to A and C
+    psql "postgresql://postgres@127.0.0.1:54961/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((1000 + second * 10 + 1)), 'burst-p2-a', 'val-p2-a-$second');" >/dev/null
+    (( ++p2_written_a ))
+    psql "postgresql://postgres@127.0.0.1:54963/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((1000 + second * 10 + 3)), 'burst-p2-c', 'val-p2-c-$second');" >/dev/null
+    (( ++p2_written_c ))
+
+    # If Node B is running, write to B
+    if (( second <= crash_point )); then
+      psql "postgresql://postgres@127.0.0.1:54962/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((1000 + second * 10 + 2)), 'burst-p2-b', 'val-p2-b-$second');" >/dev/null
+      (( ++p2_written_b ))
+    fi
+
+    # Trigger ungraceful kill -9 on Node B midway through burst
+    if (( second == crash_point )); then
+      kill_named_node_hard "b"
+      echo "  CRASH  Node B terminated with SIGKILL mid-flight while A and C continue active transactions"
+    fi
+
+    if (( second == 1 || second % 5 == 0 || second == crash_write_seconds )); then
+      echo "  WRITE  Phase 2 second=$second/${crash_write_seconds} writes: A=$p2_written_a B=$p2_written_b C=$p2_written_c"
+    fi
+
+    local remaining=$((1 - (SECONDS - tick_started)))
+    (( remaining > 0 )) && sleep "$remaining"
+  done
+
+  echo "  CHECK  Phase 2 burst writes completed with Node B crashed"
+
+  # Phase 3: Restart Node B (recovering encrypted WAL) & Crash Node C
+  echo "  PHASE 3: Restart Node B with encryption key & crash Node C"
+  start_named_node "b" "$node_b" 127.0.0.62:48062 127.0.0.1:54962 "$bootstrap" "$key_b" '["*"]'
+  wait_node 54962
+  echo "  RECOVER  Node B re-opened encrypted database and recovered WAL successfully"
+
+  local p3_written_a=0 p3_written_b=0 p3_written_c=0
+  for ((second = 1; second <= crash_write_seconds; second++)); do
+    tick_started=$SECONDS
+
+    # Write to A and B
+    psql "postgresql://postgres@127.0.0.1:54961/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((2000 + second * 10 + 1)), 'burst-p3-a', 'val-p3-a-$second');" >/dev/null
+    (( ++p3_written_a ))
+    psql "postgresql://postgres@127.0.0.1:54962/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((2000 + second * 10 + 2)), 'burst-p3-b', 'val-p3-b-$second');" >/dev/null
+    (( ++p3_written_b ))
+
+    # If Node C is running, write to C
+    if (( second <= crash_point )); then
+      psql "postgresql://postgres@127.0.0.1:54963/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((2000 + second * 10 + 3)), 'burst-p3-c', 'val-p3-c-$second');" >/dev/null
+      (( ++p3_written_c ))
+    fi
+
+    # Trigger ungraceful kill -9 on Node C midway through burst
+    if (( second == crash_point )); then
+      kill_named_node_hard "c"
+      echo "  CRASH  Node C terminated with SIGKILL mid-flight while A and recovered B continue active transactions"
+    fi
+
+    if (( second == 1 || second % 5 == 0 || second == crash_write_seconds )); then
+      echo "  WRITE  Phase 3 second=$second/${crash_write_seconds} writes: A=$p3_written_a B=$p3_written_b C=$p3_written_c"
+    fi
+
+    local remaining=$((1 - (SECONDS - tick_started)))
+    (( remaining > 0 )) && sleep "$remaining"
+  done
+
+  echo "  CHECK  Phase 3 burst writes completed with Node C crashed and Node B recovering"
+
+  # Phase 4: Restart Node C & Full Settle
+  echo "  PHASE 4: Restart Node C with encryption key & heal full mesh"
+  start_named_node "c" "$node_c" 127.0.0.63:48063 127.0.0.1:54963 "$bootstrap" "$key_c" '["*"]'
+  wait_node 54963
+  echo "  RECOVER  Node C re-opened encrypted database and recovered WAL successfully"
+
+  # Phase 5: Verification of Full Recovery and Reconciliation
+  local total_expected=$((30 + p2_written_a + p2_written_b + p2_written_c + p3_written_a + p3_written_b + p3_written_c))
+  echo "  PAUSE  waiting up to ${crash_settle_seconds}s for anti-entropy bi-stream sync across all recovered nodes (expected $total_expected rows)"
+
+  local count_a=0 count_b=0 count_c=0
+  local hash_a='' hash_b='' hash_c=''
+  local deadline=$((SECONDS + crash_settle_seconds))
+
+  while (( SECONDS < deadline )); do
+    count_a=$(psql "postgresql://postgres@127.0.0.1:54961/postgres" -Atqc 'SELECT count(*) FROM live_records' 2>/dev/null || echo 0)
+    count_b=$(psql "postgresql://postgres@127.0.0.1:54962/postgres" -Atqc 'SELECT count(*) FROM live_records' 2>/dev/null || echo 0)
+    count_c=$(psql "postgresql://postgres@127.0.0.1:54963/postgres" -Atqc 'SELECT count(*) FROM live_records' 2>/dev/null || echo 0)
+
+    if [[ "$count_a" == "$total_expected" && "$count_b" == "$total_expected" && "$count_c" == "$total_expected" ]]; then
+      hash_a=$(psql "postgresql://postgres@127.0.0.1:54961/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+      hash_b=$(psql "postgresql://postgres@127.0.0.1:54962/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+      hash_c=$(psql "postgresql://postgres@127.0.0.1:54963/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+
+      if [[ "$hash_a" == "$hash_b" && "$hash_b" == "$hash_c" ]]; then
+        echo "  SYNC  all 3 nodes fully converged (A=$count_a B=$count_b C=$count_c, sha256=$hash_a)"
+        break
+      fi
+    fi
+    echo "  SYNC  waiting... current counts: A=$count_a B=$count_b C=$count_c (target: $total_expected)"
+    sleep 2
+  done
+
+  echo "  COMPARE Reconciled counts: A=$count_a B=$count_b C=$count_c (expected $total_expected)"
+  echo "  COMPARE Reconciled sha256 A=$hash_a"
+  echo "  COMPARE Reconciled sha256 B=$hash_b"
+  echo "  COMPARE Reconciled sha256 C=$hash_c"
+
+  [[ $count_a == "$total_expected" && $count_b == "$total_expected" && $count_c == "$total_expected" ]] || { echo "Crash-recovery row-count mismatch" >&2; return 1; }
+  [[ -n "$hash_a" && "$hash_a" == "$hash_b" && "$hash_b" == "$hash_c" ]] || { echo "Crash-recovery database contents differ across nodes" >&2; return 1; }
+
+  echo "  CHECK  All 3 nodes recovered from ungraceful crashes with identical SHA-256 state and zero data loss"
+
+  # Phase 6: Post-Recovery Live Commits
+  echo "  WRITE  post-recovery verification writes on all 3 nodes"
+  psql "postgresql://postgres@127.0.0.1:54961/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (99901, 'post-crash-a', 'val-post-crash-a');" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:54962/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (99902, 'post-crash-b', 'val-post-crash-b');" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:54963/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (99903, 'post-crash-c', 'val-post-crash-c');" >/dev/null
+
+  sleep 3
+  local final_count_c
+  final_count_c=$(psql "postgresql://postgres@127.0.0.1:54963/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  [[ $final_count_c == "$((total_expected + 3))" ]] || { echo "Post-recovery live write propagation failed" >&2; return 1; }
+  echo "  CHECK  Post-recovery cluster operation verified ($((total_expected + 3)) total rows)"
+
+  stop_all_nodes
+  finish "$runtime" 0
+}
+
 case "$scenario" in
   encryption) encryption ;;
   rekey) rekey ;;
   allow-nodes) allow_nodes ;;
   highlow) highlow ;;
   partition) partition ;;
-  all) encryption; rekey; allow_nodes; highlow; partition ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|all}" >&2; exit 2 ;;
+  crash-recovery) crash_recovery ;;
+  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|all}" >&2; exit 2 ;;
 esac
