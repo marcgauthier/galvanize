@@ -49,7 +49,7 @@ In a nutshell, GALVANIZE:
 
 ## Usage overview
 
-Run the GALVANIZE agent on every node or host in the cluster. Other programs running on the node use the HTTP API to query the local GALVANIZE SQLite database, add and update data, and subscribe to change notifications.
+Run the GALVANIZE agent on every node or host in the cluster. Applications can access the local GALVANIZE database through its HTTP endpoint or its PostgreSQL wire-protocol endpoint. The PostgreSQL endpoint provides protocol compatibility only: queries must use SQLite SQL syntax. The HTTP API also supports querying and updating the database and subscribing to change notifications.
 
 The `corrosion` CLI provides administration and database access. The executable name remains `corrosion` for compatibility with the upstream project.
 

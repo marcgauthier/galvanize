@@ -58,9 +58,10 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
   - Discovery filtering in `spawn_swim_announcer`.
 
 ### 7. Live PostgreSQL-Wire Node Tests
-- **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|all}` after `cargo build -p corrosion`.
+- **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|all}` (or individual `tests-live/<scenario>/run.sh`) after `cargo build -p corrosion`.
 - **Behavior:** each scenario creates isolated `node-*` folders, starts real Galvanize agents, and makes all application SQL requests through PostgreSQL wire listeners using `psql`.
 - **Retention:** successful runtime directories are removed. Failed runs are moved to `tests-live/failures/` with encrypted databases and agent logs for diagnosis.
 - **High/Low:** the runner executes the full end-to-end `highlow` scenario verifying Low node PostgreSQL writes, air-gap artifact packaging, RSA-OAEP/Ed25519 signing/encryption, directory staging transport, and High node background ingestion/updates/deletes.
 - **Partition:** 4-node split-brain test ({A, B} vs {C, D}) verifying strict intra-partition isolation, concurrent partitioned writes, network healing, and anti-entropy bi-stream reconciliation to identical SHA-256 state across all nodes.
 - **Crash Recovery:** 3-node cluster crash-recovery test executing ungraceful `kill -9` mid-transaction bursts, rolling crashes of Nodes B and C, SQLite3MC encrypted WAL recovery, and anti-entropy reconciliation to identical SHA-256 database state across all nodes.
+- **CRDT Contention:** 3-node concurrent mutation test executing parallel disjoint column updates on identical rows, same-column Last-Write-Wins (LWW) contention, and concurrent delete interleaving, validating CR-SQLite conflict-free convergence to identical SHA-256 database state across all nodes.
