@@ -34,6 +34,7 @@ struct TransportInner {
     /// Last `path.latest_rtt` pushed per peer by [`Transport::sample_rtts`],
     /// used to skip re-pushing a measurement that has not moved.
     rtt_marks: StdMutex<HashMap<SocketAddr, Duration>>,
+    allow_list: corro_types::config::AllowList,
 }
 
 #[derive(Debug)]
@@ -83,6 +84,8 @@ pub enum TransportError {
     TimedOut(#[from] Elapsed),
     #[error(transparent)]
     Stopped(#[from] quinn::StoppedError),
+    #[error("destination {0} is not allowed by gossip allow-list")]
+    NotAllowed(SocketAddr),
     #[error("no {family} client socket bound for destination {addr}")]
     NoClientSocket {
         family: &'static str,
@@ -117,6 +120,7 @@ impl Transport {
             rtt_tx,
             path_snapshots: Default::default(),
             rtt_marks: Default::default(),
+            allow_list: config.allow_list.clone(),
         })))
     }
 
@@ -404,6 +408,10 @@ impl Transport {
         addr: SocketAddr,
         traffic: TrafficClass,
     ) -> Result<Connection, TransportError> {
+        if !self.0.allow_list.is_allowed(&addr) {
+            return Err(TransportError::NotAllowed(addr));
+        }
+
         let conn_lock = self.get_lock(addr).await;
 
         let mut lock = conn_lock.lock().await;
@@ -703,3 +711,51 @@ fn test_conn(conn: &Connection) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corro_types::config::{AllowList, AllowRule};
+
+    #[tokio::test]
+    async fn test_transport_allow_list_rejection() -> eyre::Result<()> {
+        let (rtt_tx, _rtt_rx) = mpsc::channel(10);
+        let gossip_config = GossipConfig {
+            bind_addr: "127.0.0.1:0".parse()?,
+            external_addr: None,
+            client_addr: Some("127.0.0.1:0".parse()?),
+            client_addr_v4: None,
+            client_addr_v6: None,
+            bootstrap: vec![],
+            allow_mixed_ip: false,
+            tls: None,
+            plaintext: true,
+            max_mtu: None,
+            idle_timeout_secs: 5,
+            disable_gso: false,
+            member_id: None,
+            compression: None,
+            broadcast: Default::default(),
+            allow_list: AllowList::new(vec![
+                AllowRule::Ip("10.0.0.1".parse()?),
+                AllowRule::Network("192.168.1.0/24".parse()?),
+            ]),
+        };
+
+        let transport = Transport::new(&gossip_config, rtt_tx).await?;
+
+        // 127.0.0.1:8787 is not allowed
+        let forbidden_addr: SocketAddr = "127.0.0.1:8787".parse()?;
+        let res = transport.send_datagram(forbidden_addr, Bytes::from_static(b"hello")).await;
+        assert!(matches!(res, Err(TransportError::NotAllowed(addr)) if addr == forbidden_addr));
+
+        let res_uni = transport.send_uni(forbidden_addr, Bytes::from_static(b"hello")).await;
+        assert!(matches!(res_uni, Err(TransportError::NotAllowed(addr)) if addr == forbidden_addr));
+
+        let res_bi = transport.open_bi(forbidden_addr).await;
+        assert!(matches!(res_bi, Err(TransportError::NotAllowed(addr)) if addr == forbidden_addr));
+
+        Ok(())
+    }
+}
+

@@ -8,6 +8,7 @@ mod bi;
 mod bootstrap;
 mod error;
 mod handlers;
+pub mod highlow;
 mod metrics;
 mod reaper;
 mod run_root;

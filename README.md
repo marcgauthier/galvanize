@@ -1,62 +1,66 @@
-# Corrosion
-Gossip-based service discovery (and more) for large distributed systems.
+# GALVANIZE
 
-## Why we built Corrosion
+GALVANIZE is a security-focused fork of [Corrosion](https://github.com/superfly/corrosion): a gossip-based, distributed SQLite database for large systems. It retains Corrosion's eventually consistent, local-first data model while adding encryption at rest, controlled peer replication, and one-way cross-domain replication.
 
-We built Corrosion specifically for service discovery across a large global network, replacing Consul’s central state database with eventually consistent state distributed across our hosts.
+## Why GALVANIZE
 
-Our new tool needed to deliver the following:
+GALVANIZE is for deployments that need distributed state without giving up control of data at rest or replication paths. Each node has a local SQLite database, changes are synchronized through an eventually consistent mesh, and applications read from their local node.
 
-### Fast reads and writes
+### Encryption at rest
 
-Getting state (data) from a central remote source can be incredibly expensive (at least 300ms for a round-trip to something on the other side of the world), but usually takes less than 1ms from a local source.
+Local SQLite databases can be encrypted with SQLite3 Multiple Ciphers (SQLite3MC). Database keys are supplied through environment variables rather than stored in configuration files, and the `corrosion rekey` command supports safely rotating an existing database key while the agent is stopped.
 
-### Fast, eventual, consistency
+### Cross-domain, unidirectional replication
 
-Many use cases can cope with eventual consistency, especially if a consistent state is attained sooner than later. Raft fell short for some use cases at Fly.io where round-trips to a centralized location are too expensive.
+The optional High/Low replication feature carries changes in one direction from a Low domain to a High domain. It supports staged directory/USB-style transfer and network transports, with encrypted, signed artifacts. The receiving High domain verifies and decrypts artifacts before applying them; it does not replicate changes back to Low.
 
-### Flexibility
+### Allow-list replication control
 
-Global state for a distributed system isn't one-size-fits-all. Flexible schemas and queries are essential.
+Gossip peer communication can be limited to an explicit allow-list of IP addresses and CIDR ranges. The allow-list is enforced for inbound and outbound cluster traffic, including membership gossip, synchronization, replication broadcasts, and discovery bootstrap.
 
-## How Corrosion works
+## How it works
 
-In a nutshell, Corrosion:
+In a nutshell, GALVANIZE:
 
 - Maintains a SQLite database on each node
 - Gossips local changes throughout the cluster
 - Uses [CR-SQLite](https://github.com/vlcn-io/cr-sqlite) for conflict resolution with CRDTs
 - Uses [Foca](https://github.com/caio/foca) to manage cluster membership using a SWIM protocol
-- Periodically synchronizes with a subset of other cluster nodes, to ensure consistency
+- Periodically synchronizes with a subset of other cluster nodes to ensure consistency
+- Encrypts each local database at rest when a database key is configured
+- Can restrict cluster peer traffic with `[gossip.allow-list]`
+- Can export Low-domain changes as signed, encrypted bundles for one-way High-domain ingestion
 
 ## Features
 
-- A flexible API to read from and write to Corrosion's store using SQL statements
+- A flexible API to read from and write to GALVANIZE's store using SQL statements
 - File-based schemas with on-the-fly updates
 - HTTP streaming subscriptions based on SQL queries
-- Live population of configuration files from Corrosion state with user-defined [Rhai](https://rhai.rs/) templates
-- Storage and propagation of state from locally registered Consul services, replacing the central database with Corrosion's distributed state
+- Live population of configuration files from GALVANIZE state with user-defined [Rhai](https://rhai.rs/) templates
+- Storage and propagation of state from locally registered Consul services, replacing the central database with GALVANIZE's distributed state
 - Secure peer-to-peer communication with the [QUIC](https://datatracker.ietf.org/doc/html/rfc9000) transport protocol (using [Quinn](https://github.com/quinn-rs/quinn))
+- SQLite3MC-backed encryption at rest and offline database-key rotation
+- IP/CIDR allow-list enforcement for cluster peer communication
+- Signed and encrypted, one-way Low-to-High cross-domain replication
 
 ## Usage overview
 
-Run the Corrosion agent on every node/host in the cluster. Other programs running on the node use [Corrosion's HTTP API](https://superfly.github.io/corrosion/api/index.html) to query the local Corrosion SQLite database, add and update data, and subscribe to change notifications.
+Run the GALVANIZE agent on every node or host in the cluster. Other programs running on the node use the HTTP API to query the local GALVANIZE SQLite database, add and update data, and subscribe to change notifications.
 
-The [Corrosion CLI](https://superfly.github.io/corrosion/cli/index.html) provides commands for administration and access to database and features.
+The `corrosion` CLI provides administration and database access. The executable name remains `corrosion` for compatibility with the upstream project.
 
 ### Quick start
 
-- [Prepare the Corrosion configuration file](https://superfly.github.io/corrosion/config/)
-- [Specify the initial database schema](https://superfly.github.io/corrosion/schema.html)
-- [Start the Corrosion agent](https://superfly.github.io/corrosion/cli/agent.html)
+- Prepare the agent configuration and initial database schema.
+- Configure `GALVANIZE_DB_KEY` (or `GALVANIZE_DB_PASSPHRASE`) before starting an encrypted node.
+- Optionally set `[gossip.allow-list]` to allowed peer IP addresses and CIDRs; its default is `["*"]`.
+- Configure `[highlow]` with exactly one role (`low`, `high`, or `high-replica`) to enable cross-domain transfer.
 
-See the WIP [Corrosion documentation](https://superfly.github.io/corrosion/) for more details.
+The upstream [Corrosion documentation](https://superfly.github.io/corrosion/) remains useful for the base API, schema, and agent configuration. GALVANIZE-specific changes and operational details are tracked in [GALVANIZE.md](GALVANIZE.md).
 
-## Building Corrosion
+## Building GALVANIZE
 
-Clone [https://github.com/superfly/corrosion.git](https://github.com/superfly/corrosion.git).
-
-From within the repo directory:
+From within the repository directory:
 
 ```
 cargo build --release && mv target/release/corrosion ./

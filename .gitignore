@@ -8,3 +8,6 @@
 .antithesis/config/volumes
 benchmark_results/*
 .DS_Store
+/tests-live/failures
+/tests-live/runtime
+/tests-live/*/runtime

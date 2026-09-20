@@ -87,8 +87,15 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let actor_id = {
         // we need to set auto_vacuum before any tables are created
-        let db_conn = Connection::open(&conf.db.path)?;
+        let mut db_conn = Connection::open(&conf.db.path)?;
+        corro_types::sqlite::apply_key_if_present(&mut db_conn, None)?;
         db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
+        if conf.highlow.enabled {
+            // Deliberately create these before CR-SQLite initializes user
+            // tables: high/low bookkeeping is local agent state and must not
+            // enter ordinary mesh replication.
+            galv_highlow::initialize_store(&db_conn)?;
+        }
 
         let conn = CrConn::init(db_conn)?;
         conn.query_row("SELECT crsql_site_id();", [], |row| {

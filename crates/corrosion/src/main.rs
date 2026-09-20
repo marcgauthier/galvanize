@@ -677,6 +677,44 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Rekey {
+            path,
+            cipher,
+            new_cipher,
+            current_key_env,
+            new_key_env,
+        } => {
+            let db_path = match path {
+                Some(p) => p.clone(),
+                None => cli.db_path()?,
+            };
+
+            if AdminConn::connect(cli.admin_path()).await.is_ok() {
+                eyre::bail!(
+                    "corrosion is currently running, shut it down before rekeying the database!"
+                );
+            }
+
+            match new_key_env {
+                Some(new_key_env) => galv_rekey_cli::rekey_from_environment(
+                    db_path.as_std_path(),
+                    current_key_env.as_deref(),
+                    new_key_env,
+                    cipher.as_deref(),
+                    new_cipher.as_deref(),
+                )?,
+                None => {
+                    if current_key_env.is_some() {
+                        eyre::bail!("--current-key-env requires --new-key-env");
+                    }
+                    galv_rekey_cli::interactive_rekey(
+                        db_path.as_std_path(),
+                        cipher.as_deref(),
+                        new_cipher.as_deref(),
+                    )?;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -791,6 +829,22 @@ enum Command {
         self_actor_id: bool,
         #[arg(long)]
         actor_id: Option<Uuid>,
+    },
+
+    /// Rekey the SQLite database (offline operation)
+    Rekey {
+        #[arg(long)]
+        path: Option<Utf8PathBuf>,
+        #[arg(long)]
+        cipher: Option<String>,
+        #[arg(long)]
+        new_cipher: Option<String>,
+        /// Environment variable holding the current database key. Requires --new-key-env.
+        #[arg(long)]
+        current_key_env: Option<String>,
+        /// Environment variable holding the replacement database key. Enables non-interactive rekeying.
+        #[arg(long)]
+        new_key_env: Option<String>,
     },
 
     /// Cluster interactions

@@ -23,6 +23,7 @@ corro-types = { path = "../corro-types" }
 crc32fast = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
+galv-rekey-cli = { path = "../galv-rekey-cli" }
 hostname = { workspace = true }
 hyper = { workspace = true }
 metrics = { workspace = true }

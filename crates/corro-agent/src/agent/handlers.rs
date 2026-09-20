@@ -112,12 +112,18 @@ pub fn spawn_incoming_connection_handlers(
     tripwire: &Tripwire,
     connecting: quinn::Incoming,
 ) {
+    let remote_addr = connecting.remote_address();
+    if !agent.config().gossip.allow_list.is_allowed(&remote_addr) {
+        debug!(%remote_addr, "refusing incoming connection: remote address not in gossip allow-list");
+        counter!("corro.peer.connection.refused.not_allowed").increment(1);
+        connecting.refuse();
+        return;
+    }
+
     let agent = agent.clone();
     let bookie = bookie.clone();
     let tripwire = tripwire.clone();
     tokio::spawn(async move {
-        let remote_addr = connecting.remote_address();
-        // let local_ip = connecting.local_ip().unwrap();
         trace!("got a connection from {remote_addr}");
 
         let conn = match connecting.await {
@@ -277,7 +283,10 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tr
                 .await
                 {
                     Ok(addrs) => {
-                        for addr in addrs.iter() {
+                        for addr in addrs
+                            .iter()
+                            .filter(|addr| agent.config().gossip.allow_list.is_allowed(addr))
+                        {
                             debug!("Bootstrapping w/ {addr}");
                             if let Err(e) = agent
                                 .tx_foca()

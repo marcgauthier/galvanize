@@ -11,6 +11,7 @@ use speedy::{Readable, Writable};
 use tracing::{debug, trace, warn};
 
 use crate::{
+    actor::ActorId,
     agent::{Agent, BookedVersions, ChangeError},
     base::CrsqlSeq,
     broadcast::{ChangesetPerTable, Timestamp},
@@ -250,6 +251,12 @@ pub fn insert_local_changes(
                     version: Some(db_version),
                 })?;
 
+            if agent.config().highlow.enabled && agent.config().highlow.low.is_some() {
+                if let Err(e) = capture_highlow_events_for_actor(agent, tx, actor_id, db_version) {
+                    tracing::error!("failed to capture highlow events for db_version {db_version}: {e}");
+                }
+            }
+
             Ok(Some(InsertChangesInfo {
                 db_version,
                 last_seq,
@@ -257,6 +264,188 @@ pub fn insert_local_changes(
             }))
         }
     }
+}
+
+pub fn capture_highlow_events_for_actor(
+    agent: &Agent,
+    tx: &Connection,
+    actor_id: ActorId,
+    db_version: CrsqlDbVersion,
+) -> Result<(), ChangeError> {
+    let config = agent.config();
+    let low = match &config.highlow.low {
+        Some(low) if config.highlow.enabled => low,
+        _ => return Ok(()),
+    };
+
+    let mut prepped = tx
+        .prepare_cached(
+            r#"
+                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                    FROM crsql_changes
+                    WHERE db_version = ?
+                    AND site_id = ?
+                    ORDER BY seq ASC
+            "#,
+        )
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
+
+    let rows = prepped
+        .query_map(rusqlite::params![db_version, actor_id.as_bytes()], row_to_change)
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
+
+    let mut table_pk_groups: indexmap::IndexMap<(String, Vec<u8>), Vec<Change>> =
+        indexmap::IndexMap::new();
+    for row in rows {
+        let change = row.map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
+        if change.table.starts_with("__galv_")
+            || change.table.starts_with("__corro_")
+            || change.table.starts_with("crsql_")
+        {
+            continue;
+        }
+        table_pk_groups
+            .entry((change.table.to_string(), change.pk.clone()))
+            .or_default()
+            .push(change);
+    }
+
+    if table_pk_groups.is_empty() {
+        return Ok(());
+    }
+
+    let mut current_seq: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM __galv_highlow_events WHERE stream_id = ?1",
+            [&low.stream_id],
+            |r| r.get(0),
+        )
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO __galv_highlow_events (stream_id, sequence, event_json) VALUES (?1, ?2, ?3)",
+        )
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
+
+    let schema = agent.schema().read();
+    let pk_names_by_table: std::collections::HashMap<String, Vec<String>> = schema
+        .tables
+        .iter()
+        .map(|(name, table)| (name.clone(), table.pk.iter().cloned().collect()))
+        .collect();
+    drop(schema);
+
+    for ((table, pk_bytes), changes) in table_pk_groups {
+        current_seq += 1;
+        let is_delete = changes.iter().any(|c| c.cid.as_str() == "-1");
+        let operation = if is_delete {
+            galv_highlow::Operation::Delete
+        } else {
+            galv_highlow::Operation::Upsert
+        };
+
+        let mut columns = Vec::new();
+        if !is_delete {
+            for c in &changes {
+                if c.cid.as_str() != "-1" {
+                    let val = match &c.val {
+                        SqliteValue::Null => galv_highlow::Value::Null,
+                        SqliteValue::Integer(i) => galv_highlow::Value::Integer(*i),
+                        SqliteValue::Real(r) => galv_highlow::Value::Real(r.0),
+                        SqliteValue::Text(t) => galv_highlow::Value::Text(t.to_string()),
+                        SqliteValue::Blob(b) => galv_highlow::Value::blob(b),
+                    };
+                    columns.push(galv_highlow::Column {
+                        name: c.cid.to_string(),
+                        value: val,
+                    });
+                }
+            }
+        }
+
+        let mut pk_map = serde_json::Map::new();
+        let pk_cols = pk_names_by_table.get(&table);
+        if let Ok(unpacked) = crate::pubsub::unpack_columns(&pk_bytes) {
+            for (idx, val_ref) in unpacked.into_iter().enumerate() {
+                let col_name = pk_cols
+                    .and_then(|cols| cols.get(idx).cloned())
+                    .unwrap_or_else(|| format!("pk_{idx}"));
+                let json_val = match val_ref.0 {
+                    rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                    rusqlite::types::ValueRef::Integer(i) => serde_json::json!(i),
+                    rusqlite::types::ValueRef::Real(r) => serde_json::json!(r),
+                    rusqlite::types::ValueRef::Text(t) => {
+                        serde_json::Value::String(String::from_utf8_lossy(t).into_owned())
+                    }
+                    rusqlite::types::ValueRef::Blob(b) => {
+                        let hex_str = hex::encode(b);
+                        serde_json::Value::String(hex_str)
+                    }
+                };
+                pk_map.insert(col_name, json_val);
+            }
+        } else if let Ok(s) = std::str::from_utf8(&pk_bytes) {
+            pk_map.insert("id".to_string(), serde_json::Value::String(s.to_string()));
+        } else {
+            pk_map.insert(
+                "id".to_string(),
+                serde_json::Value::String(hex::encode(&pk_bytes)),
+            );
+        }
+
+        let event = galv_highlow::Event {
+            stream_id: low.stream_id.clone(),
+            sequence: current_seq,
+            transaction_id: format!("{}:{}", actor_id, db_version),
+            table,
+            primary_key: pk_map,
+            operation,
+            columns,
+            source_actor: actor_id.to_string(),
+            committed_at_ms: now_ms,
+        };
+
+        let json_bytes = serde_json::to_vec(&event).map_err(|e| ChangeError::Rusqlite {
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(e)),
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
+
+        stmt.execute(rusqlite::params![event.stream_id, event.sequence, json_bytes])
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(db_version),
+            })?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

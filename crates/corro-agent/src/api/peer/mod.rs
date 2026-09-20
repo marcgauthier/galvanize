@@ -2520,6 +2520,7 @@ mod tests {
                 dict_file: None,
             }),
             broadcast: BroadcastConfig::Gossip,
+            allow_list: Default::default(),
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

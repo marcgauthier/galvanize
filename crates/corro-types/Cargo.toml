@@ -31,6 +31,7 @@ foca = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 indexmap = { workspace = true }
+ipnet = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
 once_cell = { workspace = true }
@@ -64,6 +65,8 @@ strum = { workspace = true }
 antithesis_sdk = { workspace = true }
 lazy_static = { workspace = true }
 zstd = { workspace = true }
+galv-rekey-cli = { path = "../galv-rekey-cli" }
+galv-highlow = { path = "../galv-highlow" }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }

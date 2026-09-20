@@ -6,6 +6,10 @@ schema_paths = ["/etc/corrosion/schemas"]
 addr = "[::]:8787"
 bootstrap = []
 plaintext = true
+# Optional allow-list to limit cluster peer replication traffic (SWIM, broadcast, sync, datagrams).
+# Defaults to ["*"] (allow all). Can specify IPs, subnets (CIDRs), or wildcard "*".
+# allow-list = ["10.0.0.1", "10.0.0.2", "192.168.1.0/24"]
+# allow-list = ["*"]
 
 [api]
 addr = "127.0.0.1:8080"
@@ -18,3 +22,23 @@ prometheus.addr = "127.0.0.1:9090"
 
 [log]
 format = "json"
+
+# Optional one-way Low -> High replication. It is disabled unless explicitly
+# enabled. Configure exactly one role, and provide all key material via the
+# named environment variables (never in this file).
+#
+# [highlow]
+# enabled = true
+#
+# [highlow.transport]
+# kind = "https"
+# endpoint = "https://airgap.example.invalid/inbox"
+# bearer-token-env = "GALV_HIGHLOW_TOKEN"
+#
+# [highlow.low]
+# stream-id = "plant-a"
+# network-name = "plant-a-network"
+# upload-interval-seconds = 60
+# recipient-key-id = "high-2026-01"
+# recipient-rsa-public-key-env = "GALV_HIGHLOW_HIGH_RSA_PUBLIC_KEY"
+# sender-signing-key-env = "GALV_HIGHLOW_LOW_ED25519_KEY"

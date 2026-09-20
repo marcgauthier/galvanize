@@ -363,11 +363,31 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
     dir
 });
 
+pub fn apply_key_if_present(
+    conn: &mut rusqlite::Connection,
+    key: Option<&galv_rekey_cli::KeyPayload>,
+) -> rusqlite::Result<()> {
+    if let Some(payload) = key {
+        galv_rekey_cli::apply_encryption_pragma(conn, payload)?;
+    } else if let Some(env_key) = galv_rekey_cli::get_env_key() {
+        galv_rekey_cli::apply_encryption_pragma(conn, &env_key)?;
+    }
+    Ok(())
+}
+
 pub fn rusqlite_to_crsqlite_write(
     conn: rusqlite::Connection,
     cache_size_kib: i64,
 ) -> rusqlite::Result<CrConn> {
-    let conn = rusqlite_to_crsqlite(conn)?;
+    rusqlite_to_crsqlite_write_with_key(conn, cache_size_kib, None)
+}
+
+pub fn rusqlite_to_crsqlite_write_with_key(
+    conn: rusqlite::Connection,
+    cache_size_kib: i64,
+    key: Option<&galv_rekey_cli::KeyPayload>,
+) -> rusqlite::Result<CrConn> {
+    let conn = rusqlite_to_crsqlite_with_key(conn, key)?;
     conn.execute_batch(&format!(
         "
         PRAGMA cache_size = {};
@@ -380,7 +400,15 @@ pub fn rusqlite_to_crsqlite_write(
     Ok(conn)
 }
 
-pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+pub fn rusqlite_to_crsqlite(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+    rusqlite_to_crsqlite_with_key(conn, None)
+}
+
+pub fn rusqlite_to_crsqlite_with_key(
+    mut conn: rusqlite::Connection,
+    key: Option<&galv_rekey_cli::KeyPayload>,
+) -> rusqlite::Result<CrConn> {
+    apply_key_if_present(&mut conn, key)?;
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
@@ -389,6 +417,7 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
 
     Ok(CrConn(conn))
 }
+
 
 #[derive(Debug)]
 pub struct CrConn(Connection);

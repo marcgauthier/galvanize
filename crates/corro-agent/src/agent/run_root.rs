@@ -6,7 +6,7 @@ use crate::agent::util::execute_schema_from_paths;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
-        metrics,
+        highlow, metrics,
         reaper::spawn_reaper,
         setup, util, AgentOptions,
     },
@@ -239,6 +239,15 @@ async fn run(
     //// Start an incoming (corrosion) connection handler.  This
     //// future tree spawns additional message type sub-handlers
     handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
+
+    if agent.config().highlow.enabled {
+        if agent.config().highlow.low.is_some() {
+            highlow::spawn_highlow_exporter(agent.clone(), tripwire.clone());
+        }
+        if agent.config().highlow.high.is_some() {
+            highlow::spawn_highlow_receiver(agent.clone(), tripwire.clone());
+        }
+    }
 
     let changes_handle = spawn_counted(
         handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())

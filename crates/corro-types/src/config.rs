@@ -114,6 +114,213 @@ pub struct Config {
     pub consul: Option<ConsulConfig>,
     #[serde(default)]
     pub reaper: Option<ReaperConfig>,
+    /// Optional one-way Low -> High air-gap replication. Disabled by default.
+    #[serde(default)]
+    pub highlow: HighLowConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HighLowConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub transport: Option<HighLowTransportConfig>,
+    pub low: Option<HighLowLowConfig>,
+    pub high: Option<HighLowHighConfig>,
+    pub high_replica: Option<HighLowHighReplicaConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HighLowTransportConfig {
+    pub kind: HighLowTransportKind,
+    pub endpoint: String,
+    pub username: Option<String>,
+    pub password_env: Option<String>,
+    pub private_key_env: Option<String>,
+    pub private_key_passphrase_env: Option<String>,
+    pub host_key_sha256: Option<String>,
+    pub ca_file: Option<Utf8PathBuf>,
+    pub bearer_token_env: Option<String>,
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum HighLowTransportKind {
+    Directory,
+    Ftp,
+    Ftps,
+    Sftp,
+    Smb,
+    Http,
+    Https,
+}
+
+impl HighLowTransportConfig {
+    pub fn to_galv_transport(&self) -> galv_highlow::transport::TransportConfig {
+        let kind = match self.kind {
+            HighLowTransportKind::Directory => galv_highlow::transport::TransportKind::Directory,
+            HighLowTransportKind::Ftp => galv_highlow::transport::TransportKind::Ftp,
+            HighLowTransportKind::Ftps => galv_highlow::transport::TransportKind::Ftps,
+            HighLowTransportKind::Sftp => galv_highlow::transport::TransportKind::Sftp,
+            HighLowTransportKind::Smb => galv_highlow::transport::TransportKind::Directory,
+            HighLowTransportKind::Http => galv_highlow::transport::TransportKind::Http,
+            HighLowTransportKind::Https => galv_highlow::transport::TransportKind::Https,
+        };
+        let password = self.password_env.as_deref().and_then(|env| std::env::var(env).ok());
+        let bearer_token = self.bearer_token_env.as_deref().and_then(|env| std::env::var(env).ok());
+        galv_highlow::transport::TransportConfig {
+            kind,
+            endpoint: self.endpoint.clone(),
+            username: self.username.clone(),
+            password,
+            bearer_token,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HighLowLowConfig {
+    pub stream_id: String,
+    pub network_name: String,
+    pub upload_interval_seconds: u64,
+    pub recipient_key_id: String,
+    pub recipient_rsa_public_key_env: String,
+    pub sender_signing_key_env: String,
+}
+
+impl HighLowLowConfig {
+    pub fn recipient_rsa_public_key(&self) -> Result<String, String> {
+        std::env::var(&self.recipient_rsa_public_key_env)
+            .map_err(|_| format!("environment variable {} for recipient RSA public key not found", self.recipient_rsa_public_key_env))
+    }
+
+    pub fn sender_signing_key(&self) -> Result<String, String> {
+        std::env::var(&self.sender_signing_key_env)
+            .map_err(|_| format!("environment variable {} for sender Ed25519 signing key not found", self.sender_signing_key_env))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HighLowHighConfig {
+    pub accepted_streams: Vec<String>,
+    pub download_interval_seconds: u64,
+    pub recipient_key_id: String,
+    pub recipient_rsa_private_key_env: String,
+    pub permitted_sender_key_envs: Vec<String>,
+}
+
+impl HighLowHighConfig {
+    pub fn recipient_rsa_private_key(&self) -> Result<String, String> {
+        std::env::var(&self.recipient_rsa_private_key_env)
+            .map_err(|_| format!("environment variable {} for recipient RSA private key not found", self.recipient_rsa_private_key_env))
+    }
+
+    pub fn permitted_sender_keys(&self) -> Result<Vec<String>, String> {
+        let mut keys = Vec::new();
+        for env_name in &self.permitted_sender_key_envs {
+            let key = std::env::var(env_name)
+                .map_err(|_| format!("environment variable {env_name} for permitted sender key not found"))?;
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HighLowHighReplicaConfig {
+    pub accepted_streams: Vec<String>,
+}
+
+impl HighLowConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let roles = self.low.is_some() as u8
+            + self.high.is_some() as u8
+            + self.high_replica.is_some() as u8;
+        if roles != 1 {
+            return Err(ConfigError::HighLow(
+                "exactly one of low, high, or high-replica must be configured".into(),
+            ));
+        }
+
+        if self.high_replica.is_none() && self.transport.is_none() {
+            return Err(ConfigError::HighLow(
+                "low and high roles require a transport".into(),
+            ));
+        }
+        if let Some(transport) = &self.transport {
+            if transport.endpoint.is_empty() {
+                return Err(ConfigError::HighLow(
+                    "transport.endpoint must not be empty".into(),
+                ));
+            }
+            if transport.endpoint.contains('@') {
+                return Err(ConfigError::HighLow(
+                    "credentials must not be embedded in transport.endpoint".into(),
+                ));
+            }
+            if transport.kind == HighLowTransportKind::Sftp
+                && transport
+                    .host_key_sha256
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+            {
+                return Err(ConfigError::HighLow(
+                    "sftp requires transport.host-key-sha256 pinning".into(),
+                ));
+            }
+        }
+        if let Some(low) = &self.low {
+            if low.stream_id.is_empty()
+                || low.network_name.is_empty()
+                || low.recipient_key_id.is_empty()
+                || low.recipient_rsa_public_key_env.is_empty()
+                || low.sender_signing_key_env.is_empty()
+            {
+                return Err(ConfigError::HighLow(
+                    "low role has a required empty field".into(),
+                ));
+            }
+            if low.upload_interval_seconds == 0 {
+                return Err(ConfigError::HighLow(
+                    "low.upload-interval-seconds must be positive".into(),
+                ));
+            }
+        }
+        if let Some(high) = &self.high {
+            if high.accepted_streams.is_empty()
+                || high.recipient_key_id.is_empty()
+                || high.recipient_rsa_private_key_env.is_empty()
+                || high.permitted_sender_key_envs.is_empty()
+            {
+                return Err(ConfigError::HighLow(
+                    "high role has a required empty field".into(),
+                ));
+            }
+            if high.download_interval_seconds == 0 {
+                return Err(ConfigError::HighLow(
+                    "high.download-interval-seconds must be positive".into(),
+                ));
+            }
+        }
+        if let Some(replica) = &self.high_replica {
+            if replica.accepted_streams.is_empty() {
+                return Err(ConfigError::HighLow(
+                    "high-replica.accepted-streams must not be empty".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -351,6 +558,114 @@ pub struct GossipConfig {
     pub compression: Option<CompressionConfig>,
     #[serde(default = "default_broadcast_config")]
     pub broadcast: BroadcastConfig,
+    /// Allowed peers IP/CIDR/host filter. Defaults to ["*"] (all peers allowed).
+    #[serde(default = "default_allow_list", alias = "allow_list", alias = "allow-list")]
+    pub allow_list: AllowList,
+}
+
+/// Filter rule for allowed peers in the gossip network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowRule {
+    Wildcard,
+    Ip(std::net::IpAddr),
+    Network(ipnet::IpNet),
+}
+
+/// List of allowed peer IPs, CIDR networks, or wildcards (`*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
+pub struct AllowList {
+    raw: Vec<String>,
+    #[serde(skip)]
+    rules: Vec<AllowRule>,
+}
+
+impl Default for AllowList {
+    fn default() -> Self {
+        Self {
+            raw: vec!["*".to_string()],
+            rules: vec![AllowRule::Wildcard],
+        }
+    }
+}
+
+impl AllowList {
+    pub fn new(rules: Vec<AllowRule>) -> Self {
+        Self {
+            raw: rules.iter().map(|r| match r {
+                AllowRule::Wildcard => "*".to_string(),
+                AllowRule::Ip(ip) => ip.to_string(),
+                AllowRule::Network(net) => net.to_string(),
+            }).collect(),
+            rules,
+        }
+    }
+
+    pub fn is_allowed(&self, addr: &SocketAddr) -> bool {
+        self.is_allowed_ip(&addr.ip())
+    }
+
+    pub fn is_allowed_ip(&self, ip: &std::net::IpAddr) -> bool {
+        if self.rules.is_empty() {
+            return true;
+        }
+        for rule in &self.rules {
+            match rule {
+                AllowRule::Wildcard => return true,
+                AllowRule::Ip(allowed_ip) => {
+                    if allowed_ip == ip {
+                        return true;
+                    }
+                }
+                AllowRule::Network(net) => {
+                    if net.contains(ip) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn raw(&self) -> &[String] {
+        &self.raw
+    }
+}
+
+impl TryFrom<Vec<String>> for AllowList {
+    type Error = String;
+
+    fn try_from(raw: Vec<String>) -> Result<Self, Self::Error> {
+        let mut rules = Vec::new();
+        for item in &raw {
+            let trimmed = item.trim();
+            if trimmed == "*" {
+                rules.push(AllowRule::Wildcard);
+            } else if let Ok(net) = trimmed.parse::<ipnet::IpNet>() {
+                rules.push(AllowRule::Network(net));
+            } else if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+                rules.push(AllowRule::Ip(ip));
+            } else if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+                rules.push(AllowRule::Ip(sock.ip()));
+            } else {
+                return Err(format!("invalid allow-list entry '{item}': expected '*', IP, CIDR (e.g. 10.0.0.0/24), or socket address"));
+            }
+        }
+        if rules.is_empty() {
+            rules.push(AllowRule::Wildcard);
+        }
+        Ok(Self { raw, rules })
+    }
+}
+
+impl From<AllowList> for Vec<String> {
+    fn from(list: AllowList) -> Self {
+        list.raw
+    }
+}
+
+pub fn default_allow_list() -> AllowList {
+    AllowList::default()
 }
 
 impl GossipConfig {
@@ -616,6 +931,8 @@ pub enum ConfigError {
     InvalidEagerRatios(#[from] plum_foca::EagerRatiosError),
     #[error(transparent)]
     ClientBinds(#[from] ClientBindsError),
+    #[error("invalid highlow configuration: {0}")]
+    HighLow(String),
 }
 
 impl Config {
@@ -653,6 +970,7 @@ impl Config {
             plumtree.eager_ratios.validate()?;
         }
         self.gossip.client_binds()?;
+        self.highlow.validate()?;
         Ok(())
     }
 }
@@ -680,9 +998,14 @@ pub struct ConfigBuilder {
     compression: Option<bool>,
     compression_level: Option<i32>,
     broadcast: Option<BroadcastConfig>,
+    allow_list: Option<AllowList>,
 }
 
 impl ConfigBuilder {
+    pub fn allow_list(mut self, allow_list: AllowList) -> Self {
+        self.allow_list = Some(allow_list);
+        self
+    }
     pub fn db_path<S: Into<Utf8PathBuf>>(mut self, db_path: S) -> Self {
         self.db_path = Some(db_path.into());
         self
@@ -844,6 +1167,7 @@ impl ConfigBuilder {
                     dict_file: None,
                 }),
                 broadcast: self.broadcast.unwrap_or_else(default_broadcast_config),
+                allow_list: self.allow_list.unwrap_or_default(),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
@@ -854,6 +1178,7 @@ impl ConfigBuilder {
 
             consul: self.consul,
             reaper: self.reaper,
+            highlow: HighLowConfig::default(),
         })
     }
 }
@@ -914,6 +1239,41 @@ pub struct TableReapConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlow_requires_one_role_and_pinned_sftp() {
+        let empty = HighLowConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(empty.validate().is_err());
+
+        let config = HighLowConfig {
+            enabled: true,
+            transport: Some(HighLowTransportConfig {
+                kind: HighLowTransportKind::Sftp,
+                endpoint: "sftp://relay.example.invalid/drop".into(),
+                username: None,
+                password_env: None,
+                private_key_env: None,
+                private_key_passphrase_env: None,
+                host_key_sha256: None,
+                ca_file: None,
+                bearer_token_env: None,
+                domain: None,
+            }),
+            low: Some(HighLowLowConfig {
+                stream_id: "low-a".into(),
+                network_name: "network-a".into(),
+                upload_interval_seconds: 60,
+                recipient_key_id: "high-key".into(),
+                recipient_rsa_public_key_env: "HIGH_KEY".into(),
+                sender_signing_key_env: "LOW_KEY".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn broadcast_config_defaults_to_gossip() {
@@ -1041,5 +1401,58 @@ mod tests {
         };
         assert!(ratios.validate().is_err());
         assert!(plum_foca::EagerRatios::default().validate().is_ok());
+    }
+
+    #[test]
+    fn test_allow_list_default_wildcard() {
+        let allow = AllowList::default();
+        assert!(allow.is_allowed(&"10.0.0.1:8787".parse().unwrap()));
+        assert!(allow.is_allowed(&"192.168.1.1:8787".parse().unwrap()));
+        assert!(allow.is_allowed(&"[::1]:8787".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_allow_list_specific_ips_and_cidrs() {
+        let list: AllowList = vec![
+            "10.0.0.1".to_string(),
+            "192.168.1.0/24".to_string(),
+            "::1".to_string(),
+        ]
+        .try_into()
+        .unwrap();
+
+        // Specific IP allowed
+        assert!(list.is_allowed(&"10.0.0.1:8787".parse().unwrap()));
+        assert!(!list.is_allowed(&"10.0.0.2:8787".parse().unwrap()));
+
+        // CIDR subnet allowed
+        assert!(list.is_allowed(&"192.168.1.1:8787".parse().unwrap()));
+        assert!(list.is_allowed(&"192.168.1.254:8787".parse().unwrap()));
+        assert!(!list.is_allowed(&"192.168.2.1:8787".parse().unwrap()));
+
+        // IPv6 allowed
+        assert!(list.is_allowed(&"[::1]:8787".parse().unwrap()));
+        assert!(!list.is_allowed(&"[::2]:8787".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_allow_list_deserialization() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:8787",
+            "allow-list": ["10.0.0.1", "10.0.0.2"]
+        }))
+        .unwrap();
+        assert_eq!(cfg.allow_list.raw(), &["10.0.0.1", "10.0.0.2"]);
+        assert!(cfg.allow_list.is_allowed(&"10.0.0.1:8787".parse().unwrap()));
+        assert!(!cfg.allow_list.is_allowed(&"10.0.0.3:8787".parse().unwrap()));
+
+        // test alias allow_list
+        let cfg2: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:8787",
+            "allow_list": ["192.168.1.0/24"]
+        }))
+        .unwrap();
+        assert!(cfg2.allow_list.is_allowed(&"192.168.1.50:8787".parse().unwrap()));
+        assert!(!cfg2.allow_list.is_allowed(&"10.0.0.1:8787".parse().unwrap()));
     }
 }

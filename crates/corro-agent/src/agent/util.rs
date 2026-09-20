@@ -1082,6 +1082,12 @@ pub async fn process_fully_buffered_changes(
                     ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
                     .execute(params![actor_id.as_bytes(), version]).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
                 info!(%actor_id, %version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+
+                if agent.config().highlow.enabled && agent.config().highlow.low.is_some() {
+                    if let Err(e) = corro_types::change::capture_highlow_events_for_actor(agent, &tx, actor_id, version) {
+                        tracing::error!("failed to capture remote highlow events for actor {actor_id} db_version {version}: {e}");
+                    }
+                }
             } else {
                 info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
             }
@@ -1625,6 +1631,12 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
         .collect::<rusqlite::Result<Vec<(CrsqlDbVersion, CrsqlSeq, i64)>>>()?;
 
     let last_rowids_len = last_rowids.len();
+
+    if agent.config().highlow.enabled && agent.config().highlow.low.is_some() {
+        if let Err(e) = corro_types::change::capture_highlow_events_for_actor(&agent, &sp, actor_id, version) {
+            tracing::error!("failed to capture fast-path highlow events for actor {actor_id} db_version {version}: {e}");
+        }
+    }
 
     debug!("successfully inserted {len} changes into crsql_changes");
     trace!("last_rowids before shift: {last_rowids:?}");

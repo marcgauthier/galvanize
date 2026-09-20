@@ -44,8 +44,8 @@ use crate::{
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{
-        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, trace_heavy_queries, CrConn,
-        Migration, SqlitePool, SqlitePoolError,
+        apply_key_if_present, rusqlite_to_crsqlite, rusqlite_to_crsqlite_write,
+        setup_conn, trace_heavy_queries, CrConn, Migration, SqlitePool, SqlitePoolError,
     },
     updates::UpdatesManager,
 };
@@ -684,7 +684,9 @@ impl SplitPool {
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
-            .create_pool_transform(move |conn| rusqlite_to_crsqlite_write(conn, cache_size_kib))?;
+            .create_pool_transform(move |conn| {
+                rusqlite_to_crsqlite_write(conn, cache_size_kib)
+            })?;
 
         debug!("built RW pool");
 
@@ -772,7 +774,8 @@ impl SplitPool {
 
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
-        let conn = rusqlite::Connection::open(&self.0.path)?;
+        let mut conn = rusqlite::Connection::open(&self.0.path)?;
+        apply_key_if_present(&mut conn, None)?;
         setup_conn(&conn)?;
         trace_heavy_queries(&conn)?;
         Ok(conn)
@@ -781,7 +784,10 @@ impl SplitPool {
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
-        let cr_conn = rusqlite_to_crsqlite_write(conn, self.0.cache_size_kib)?;
+        let cr_conn = rusqlite_to_crsqlite_write(
+            conn,
+            self.0.cache_size_kib,
+        )?;
         trace_heavy_queries(cr_conn.conn())?;
         Ok(cr_conn)
     }
@@ -814,6 +820,7 @@ impl SplitPool {
     pub async fn write_low(&self) -> Result<WriteConn, PoolError> {
         self.write_inner(&self.0.low_tx, "low").await
     }
+
 
     async fn write_inner(
         &self,
