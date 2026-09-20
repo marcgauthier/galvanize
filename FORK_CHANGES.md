@@ -70,3 +70,13 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **Large Payload & Bulk Batches:** 3-node cluster stress test validating 1,000-row atomic bulk batch transactions, multi-megabyte binary blob payloads (1.5 MB), Zstd level-15 compression/decompression, and 8 KiB chunked QUIC stream replication to bit-identical state across all mesh peers.
 - **Two-Node Benchmark:** Manual `tests-live/benchmark` scenario drives fully acknowledged 100-mutation PostgreSQL-wire transactions on one encrypted node for a configurable duration, measures convergence to a SHA-256-identical peer, and reports workload, replication-drain, and total logical protocol byte rates from Prometheus counters.
 
+### 8. SQLite Memory Mapping and WAL Journal Size Limit Configuration
+- **Configuration:** Exposed under `[db]` in `config.toml`:
+  - `mmap_size_bytes`: Maximum memory-mapped I/O size in bytes (`PRAGMA mmap_size`). Defaults to 8 GiB (`8589934592`). Setting to `0` disables memory mapping.
+  - `journal_size_limit_bytes`: Maximum WAL journal file size limit in bytes (`PRAGMA journal_size_limit`). Truncates WAL files upon checkpoint. Defaults to 1 GiB (`1073741824`). Setting to `-1` allows unlimited WAL growth.
+  - `cache_size_kib`: SQLite page cache size for writes in KiB (`PRAGMA cache_size`). Defaults to -1 GiB (`-1048576`).
+- **Implementation:**
+  - `DbConfig` and `ConfigBuilder` in [`crates/corro-types/src/config.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/config.rs).
+  - Applied on all connection pools and dedicated write connections in [`crates/corro-types/src/sqlite.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/sqlite.rs) and [`crates/corro-types/src/agent.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/agent.rs).
+
+

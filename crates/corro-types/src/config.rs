@@ -30,8 +30,20 @@ const fn default_batch_threshold_ratio() -> f64 {
     0.9
 }
 
+pub const DEFAULT_CACHE_SIZE_KIB: i64 = -1048576; // 1 GB (negative value means KiB)
+pub const DEFAULT_MMAP_SIZE_BYTES: i64 = 8589934592; // 8 GB
+pub const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 1073741824; // 1 GB
+
 const fn default_cache_size_kib() -> i64 {
-    -1048576 // 1 GB (negative value means KiB)
+    DEFAULT_CACHE_SIZE_KIB
+}
+
+const fn default_mmap_size_bytes() -> i64 {
+    DEFAULT_MMAP_SIZE_BYTES
+}
+
+const fn default_journal_size_limit_bytes() -> i64 {
+    DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
 }
 
 const fn default_reaper_interval() -> usize {
@@ -369,6 +381,14 @@ pub struct DbConfig {
     /// WARNING: Setting this too low (<100MB) can severely degrade performance.
     #[serde(default = "default_cache_size_kib")]
     pub cache_size_kib: i64,
+    /// SQLite memory-mapped I/O limit in bytes (PRAGMA mmap_size).
+    /// Default: 8589934592 (8 GB). Set to 0 to disable memory mapping.
+    #[serde(default = "default_mmap_size_bytes")]
+    pub mmap_size_bytes: i64,
+    /// SQLite WAL journal size limit in bytes (PRAGMA journal_size_limit).
+    /// Default: 1073741824 (1 GB).
+    #[serde(default = "default_journal_size_limit_bytes")]
+    pub journal_size_limit_bytes: i64,
 }
 
 impl DbConfig {
@@ -987,6 +1007,9 @@ pub struct ConfigBuilder {
     bootstrap: Option<Vec<String>>,
     log: Option<LogConfig>,
     schema_paths: Vec<Utf8PathBuf>,
+    cache_size_kib: Option<i64>,
+    mmap_size_bytes: Option<i64>,
+    journal_size_limit_bytes: Option<i64>,
     max_change_size: Option<i64>,
     consul: Option<ConsulConfig>,
     reaper: Option<ReaperConfig>,
@@ -1115,6 +1138,24 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the SQLite write page cache size in KiB.
+    pub fn cache_size_kib(mut self, size: i64) -> Self {
+        self.cache_size_kib = Some(size);
+        self
+    }
+
+    /// Set the SQLite memory-mapped I/O limit in bytes (PRAGMA mmap_size).
+    pub fn mmap_size_bytes(mut self, bytes: i64) -> Self {
+        self.mmap_size_bytes = Some(bytes);
+        self
+    }
+
+    /// Set the SQLite WAL journal size limit in bytes (PRAGMA journal_size_limit).
+    pub fn journal_size_limit_bytes(mut self, bytes: i64) -> Self {
+        self.journal_size_limit_bytes = Some(bytes);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -1134,7 +1175,9 @@ impl ConfigBuilder {
                 path: db_path,
                 schema_paths: self.schema_paths,
                 subscriptions_path: None,
-                cache_size_kib: default_cache_size_kib(),
+                cache_size_kib: self.cache_size_kib.unwrap_or_else(default_cache_size_kib),
+                mmap_size_bytes: self.mmap_size_bytes.unwrap_or_else(default_mmap_size_bytes),
+                journal_size_limit_bytes: self.journal_size_limit_bytes.unwrap_or_else(default_journal_size_limit_bytes),
             },
             api: ApiConfig {
                 bind_addr: self.api_addr,
@@ -1454,5 +1497,31 @@ mod tests {
         .unwrap();
         assert!(cfg2.allow_list.is_allowed(&"192.168.1.50:8787".parse().unwrap()));
         assert!(!cfg2.allow_list.is_allowed(&"10.0.0.1:8787".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_db_config_defaults_and_custom() {
+        // Default JSON / config
+        let db: DbConfig = serde_json::from_value(serde_json::json!({
+            "path": "/var/lib/corrosion/corrosion.db"
+        }))
+        .unwrap();
+        assert_eq!(db.path, "/var/lib/corrosion/corrosion.db");
+        assert_eq!(db.cache_size_kib, DEFAULT_CACHE_SIZE_KIB);
+        assert_eq!(db.mmap_size_bytes, DEFAULT_MMAP_SIZE_BYTES);
+        assert_eq!(db.journal_size_limit_bytes, DEFAULT_JOURNAL_SIZE_LIMIT_BYTES);
+
+        // Custom values
+        let db_custom: DbConfig = serde_json::from_value(serde_json::json!({
+            "path": "/tmp/test.db",
+            "cache_size_kib": -2097152,
+            "mmap_size_bytes": 268435456,
+            "journal_size_limit_bytes": 536870912
+        }))
+        .unwrap();
+        assert_eq!(db_custom.path, "/tmp/test.db");
+        assert_eq!(db_custom.cache_size_kib, -2097152);
+        assert_eq!(db_custom.mmap_size_bytes, 268435456);
+        assert_eq!(db_custom.journal_size_limit_bytes, 536870912);
     }
 }

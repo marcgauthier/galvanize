@@ -44,8 +44,9 @@ use crate::{
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{
-        apply_key_if_present, rusqlite_to_crsqlite, rusqlite_to_crsqlite_write,
-        setup_conn, trace_heavy_queries, CrConn, Migration, SqlitePool, SqlitePoolError,
+        apply_key_if_present, rusqlite_to_crsqlite_with_config,
+        rusqlite_to_crsqlite_write_with_config, setup_conn_with_config, trace_heavy_queries,
+        CrConn, Migration, SqlitePool, SqlitePoolError,
     },
     updates::UpdatesManager,
 };
@@ -595,6 +596,8 @@ struct SplitPoolInner {
     path: PathBuf,
     write_sema: Arc<Semaphore>,
     cache_size_kib: i64,
+    mmap_size_bytes: i64,
+    journal_size_limit_bytes: i64,
 
     read: SqlitePool,
     write: SqlitePool,
@@ -681,11 +684,18 @@ impl SplitPool {
         path: P,
         write_sema: Arc<Semaphore>,
         cache_size_kib: i64,
+        mmap_size_bytes: i64,
+        journal_size_limit_bytes: i64,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
             .create_pool_transform(move |conn| {
-                rusqlite_to_crsqlite_write(conn, cache_size_kib)
+                rusqlite_to_crsqlite_write_with_config(
+                    conn,
+                    cache_size_kib,
+                    mmap_size_bytes,
+                    journal_size_limit_bytes,
+                )
             })?;
 
         debug!("built RW pool");
@@ -693,13 +703,17 @@ impl SplitPool {
         let ro_pool = sqlite_pool::Config::new(path.as_ref())
             .read_only()
             .max_size(20)
-            .create_pool_transform(rusqlite_to_crsqlite)?;
+            .create_pool_transform(move |conn| {
+                rusqlite_to_crsqlite_with_config(conn, mmap_size_bytes, journal_size_limit_bytes)
+            })?;
         debug!("built RO pool");
 
         Ok(Self::new(
             path.as_ref().to_owned(),
             write_sema,
             cache_size_kib,
+            mmap_size_bytes,
+            journal_size_limit_bytes,
             ro_pool,
             rw_pool,
         ))
@@ -709,6 +723,8 @@ impl SplitPool {
         path: PathBuf,
         write_sema: Arc<Semaphore>,
         cache_size_kib: i64,
+        mmap_size_bytes: i64,
+        journal_size_limit_bytes: i64,
         read: SqlitePool,
         write: SqlitePool,
     ) -> Self {
@@ -734,6 +750,8 @@ impl SplitPool {
             path,
             write_sema,
             cache_size_kib,
+            mmap_size_bytes,
+            journal_size_limit_bytes,
             read,
             write,
             priority_tx,
@@ -776,7 +794,7 @@ impl SplitPool {
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
         let mut conn = rusqlite::Connection::open(&self.0.path)?;
         apply_key_if_present(&mut conn, None)?;
-        setup_conn(&conn)?;
+        setup_conn_with_config(&conn, self.0.mmap_size_bytes, self.0.journal_size_limit_bytes)?;
         trace_heavy_queries(&conn)?;
         Ok(conn)
     }
@@ -784,9 +802,11 @@ impl SplitPool {
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
-        let cr_conn = rusqlite_to_crsqlite_write(
+        let cr_conn = rusqlite_to_crsqlite_write_with_config(
             conn,
             self.0.cache_size_kib,
+            self.0.mmap_size_bytes,
+            self.0.journal_size_limit_bytes,
         )?;
         trace_heavy_queries(cr_conn.conn())?;
         Ok(cr_conn)
@@ -798,7 +818,11 @@ impl SplitPool {
             &self.0.path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let cr_conn = rusqlite_to_crsqlite(conn)?;
+        let cr_conn = rusqlite_to_crsqlite_with_config(
+            conn,
+            self.0.mmap_size_bytes,
+            self.0.journal_size_limit_bytes,
+        )?;
         trace_heavy_queries(cr_conn.conn())?;
         Ok(cr_conn)
     }

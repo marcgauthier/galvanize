@@ -382,12 +382,48 @@ pub fn rusqlite_to_crsqlite_write(
     rusqlite_to_crsqlite_write_with_key(conn, cache_size_kib, None)
 }
 
+pub fn rusqlite_to_crsqlite_write_with_config(
+    conn: rusqlite::Connection,
+    cache_size_kib: i64,
+    mmap_size_bytes: i64,
+    journal_size_limit_bytes: i64,
+) -> rusqlite::Result<CrConn> {
+    rusqlite_to_crsqlite_write_with_key_and_config(
+        conn,
+        cache_size_kib,
+        mmap_size_bytes,
+        journal_size_limit_bytes,
+        None,
+    )
+}
+
 pub fn rusqlite_to_crsqlite_write_with_key(
     conn: rusqlite::Connection,
     cache_size_kib: i64,
     key: Option<&galv_rekey_cli::KeyPayload>,
 ) -> rusqlite::Result<CrConn> {
-    let conn = rusqlite_to_crsqlite_with_key(conn, key)?;
+    rusqlite_to_crsqlite_write_with_key_and_config(
+        conn,
+        cache_size_kib,
+        crate::config::DEFAULT_MMAP_SIZE_BYTES,
+        crate::config::DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+        key,
+    )
+}
+
+pub fn rusqlite_to_crsqlite_write_with_key_and_config(
+    conn: rusqlite::Connection,
+    cache_size_kib: i64,
+    mmap_size_bytes: i64,
+    journal_size_limit_bytes: i64,
+    key: Option<&galv_rekey_cli::KeyPayload>,
+) -> rusqlite::Result<CrConn> {
+    let conn = rusqlite_to_crsqlite_with_key_and_config(
+        conn,
+        key,
+        mmap_size_bytes,
+        journal_size_limit_bytes,
+    )?;
     conn.execute_batch(&format!(
         "
         PRAGMA cache_size = {};
@@ -404,13 +440,35 @@ pub fn rusqlite_to_crsqlite(conn: rusqlite::Connection) -> rusqlite::Result<CrCo
     rusqlite_to_crsqlite_with_key(conn, None)
 }
 
+pub fn rusqlite_to_crsqlite_with_config(
+    conn: rusqlite::Connection,
+    mmap_size_bytes: i64,
+    journal_size_limit_bytes: i64,
+) -> rusqlite::Result<CrConn> {
+    rusqlite_to_crsqlite_with_key_and_config(conn, None, mmap_size_bytes, journal_size_limit_bytes)
+}
+
 pub fn rusqlite_to_crsqlite_with_key(
+    conn: rusqlite::Connection,
+    key: Option<&galv_rekey_cli::KeyPayload>,
+) -> rusqlite::Result<CrConn> {
+    rusqlite_to_crsqlite_with_key_and_config(
+        conn,
+        key,
+        crate::config::DEFAULT_MMAP_SIZE_BYTES,
+        crate::config::DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+    )
+}
+
+pub fn rusqlite_to_crsqlite_with_key_and_config(
     mut conn: rusqlite::Connection,
     key: Option<&galv_rekey_cli::KeyPayload>,
+    mmap_size_bytes: i64,
+    journal_size_limit_bytes: i64,
 ) -> rusqlite::Result<CrConn> {
     apply_key_if_present(&mut conn, key)?;
     init_cr_conn(&mut conn)?;
-    setup_conn(&conn)?;
+    setup_conn_with_config(&conn, mmap_size_bytes, journal_size_limit_bytes)?;
     sqlite_functions::add_to_connection(&conn)?;
 
     trace_heavy_queries(&conn)?;
@@ -483,16 +541,28 @@ fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 }
 
 pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
+    setup_conn_with_config(
+        conn,
+        crate::config::DEFAULT_MMAP_SIZE_BYTES,
+        crate::config::DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+    )
+}
+
+pub fn setup_conn_with_config(
+    conn: &Connection,
+    mmap_size_bytes: i64,
+    journal_size_limit_bytes: i64,
+) -> Result<(), rusqlite::Error> {
     // WAL journal mode and synchronous NORMAL for best performance / crash resilience compromise
-    conn.execute_batch(
-        r#"
+    conn.execute_batch(&format!(
+        "
             PRAGMA journal_mode = WAL;
-            PRAGMA journal_size_limit = 1073741824;
+            PRAGMA journal_size_limit = {journal_size_limit_bytes};
             PRAGMA synchronous = NORMAL;
             PRAGMA recursive_triggers = ON;
-            PRAGMA mmap_size = 8589934592; -- 8GB
-        "#,
-    )?;
+            PRAGMA mmap_size = {mmap_size_bytes};
+        "
+    ))?;
 
     rusqlite::vtab::series::load_module(conn)?;
 
@@ -684,6 +754,35 @@ mod tests {
 
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM testsbool;", (), |row| row.get(0))?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_sqlite_pragmas() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::tempdir()?;
+        let path = tmpdir.path().join("pragmas.sqlite");
+        let conn = rusqlite::Connection::open(&path)?;
+
+        let custom_cache_kib: i64 = -2097152;
+        let custom_mmap_bytes: i64 = 268435456; // 256 MB
+        let custom_journal_limit_bytes: i64 = 536870912; // 512 MB
+
+        let cr_conn = rusqlite_to_crsqlite_write_with_config(
+            conn,
+            custom_cache_kib,
+            custom_mmap_bytes,
+            custom_journal_limit_bytes,
+        )?;
+
+        let mmap_size: i64 = cr_conn.query_row("PRAGMA mmap_size;", [], |r| r.get(0))?;
+        assert_eq!(mmap_size, custom_mmap_bytes);
+
+        let journal_limit: i64 = cr_conn.query_row("PRAGMA journal_size_limit;", [], |r| r.get(0))?;
+        assert_eq!(journal_limit, custom_journal_limit_bytes);
+
+        let cache_size: i64 = cr_conn.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
+        assert_eq!(cache_size, custom_cache_kib);
+
         Ok(())
     }
 

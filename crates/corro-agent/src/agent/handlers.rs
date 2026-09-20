@@ -1698,7 +1698,13 @@ mod tests {
 
         println!("temp db: {db_path:?}");
         let write_sema = Arc::new(Semaphore::new(1));
-        let pool = SplitPool::create(db_path, write_sema.clone(), -1048576).await?;
+        let pool = SplitPool::create(
+            db_path,
+            write_sema.clone(),
+            corro_types::config::DEFAULT_CACHE_SIZE_KIB,
+            corro_types::config::DEFAULT_MMAP_SIZE_BYTES,
+            corro_types::config::DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+        ).await?;
 
         {
             let mut conn = pool.write_priority().await?;

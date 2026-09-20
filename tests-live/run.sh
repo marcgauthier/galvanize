@@ -25,7 +25,6 @@ started_at=$SECONDS
 
 [[ -x "$binary" ]] || { echo "build first: cargo build -p corrosion" >&2; exit 2; }
 command -v psql >/dev/null || { echo "psql is required for live tests" >&2; exit 2; }
-command -v curl >/dev/null || { echo "curl is required for the live-test metrics checks" >&2; exit 2; }
 
 cleanup_pids=()
 declare -A named_pids=()
@@ -365,8 +364,8 @@ encryption() {
   local second tick_started expected_rows count_a count_b hash_a hash_b
   for ((second = 1; second <= encryption_write_seconds; second++)); do
     tick_started=$SECONDS
-    psql "postgresql://postgres@127.0.0.1:54911/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((second * 10 + 1)), 'from-a-$second');" >/dev/null
-    psql "postgresql://postgres@127.0.0.1:54912/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((second * 10 + 2)), 'from-b-$second');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54911/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records (id, value) VALUES ($((second * 10 + 1)), 'from-a-$second');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54912/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records (id, value) VALUES ($((second * 10 + 2)), 'from-b-$second');" >/dev/null
     if (( second == 1 || second % 10 == 0 || second == encryption_write_seconds )); then
       echo "  WRITE  second=$second/${encryption_write_seconds} commits=A:$second B:$second"
     fi
@@ -408,7 +407,7 @@ rekey() {
   echo "== rekey: PostgreSQL write, offline rekey, restart with replacement key =="
   write_node "$runtime/node-a" 127.0.0.12:48012 127.0.0.1:54912 '[]' "$old" '["*"]'
   wait_node 54912
-  psql "postgresql://postgres@127.0.0.1:54912/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (1, 'rekey-survives');" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:54912/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records (id, value) VALUES (1, 'rekey-survives');" >/dev/null
   stop_last_node
   GALV_LIVE_OLD_KEY="$old" GALV_LIVE_NEW_KEY="$new" "$binary" --config "$runtime/node-a/config.toml" rekey --path "$runtime/node-a/corrosion.db" --current-key-env GALV_LIVE_OLD_KEY --new-key-env GALV_LIVE_NEW_KEY
   echo "  CHECK  offline rekey completed without exposing keys as arguments"
@@ -434,9 +433,9 @@ allow_nodes() {
   local second tick_started expected_rows deadline
   for ((second = 1; second <= write_seconds; second++)); do
     tick_started=$SECONDS
-    psql "postgresql://postgres@127.0.0.1:54921/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((second * 10 + 1)), 'from-a-$second');" >/dev/null
-    psql "postgresql://postgres@127.0.0.1:54922/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((second * 10 + 2)), 'from-b-$second');" >/dev/null
-    psql "postgresql://postgres@127.0.0.1:54923/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((second * 10 + 3)), 'from-c-$second');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54921/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records (id, value) VALUES ($((second * 10 + 1)), 'from-a-$second');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54922/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records (id, value) VALUES ($((second * 10 + 2)), 'from-b-$second');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54923/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records (id, value) VALUES ($((second * 10 + 3)), 'from-c-$second');" >/dev/null
     if (( second == 1 || second % 10 == 0 || second == write_seconds )); then
       echo "  WRITE  second=$second/${write_seconds} commits=A:$second B:$second C:$second"
     fi
@@ -2201,6 +2200,7 @@ benchmark() {
   local transactions inserts updates mutations write_elapsed sync_elapsed total_elapsed
   local expected_rows count_a count_b hash_a hash_b deadline
 
+  command -v curl >/dev/null || { echo "curl is required for the benchmark metrics checks" >&2; return 2; }
   rm -rf "$runtime"; mkdir -p "$runtime"; active_runtime=$runtime
   echo "== benchmark: two-node sustained write and convergence measurement =="
   echo "  PLAN      Node A commits 50 inserts + 50 updates per transaction for ${benchmark_write_seconds}s"

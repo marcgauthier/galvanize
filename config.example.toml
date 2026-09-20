@@ -1,6 +1,16 @@
 [db]
 path = "./corrosion.db"
 schema_paths = ["/etc/corrosion/schemas"]
+# Maximum memory-mapped I/O size in bytes (PRAGMA mmap_size).
+# Defaults to 8 GiB (8589934592 bytes). Set to 0 to disable memory-mapped I/O.
+# mmap_size_bytes = 8589934592
+# Maximum WAL journal file size limit in bytes (PRAGMA journal_size_limit).
+# WAL files are truncated to this size upon checkpoint. Defaults to 1 GiB (1073741824 bytes). Set to -1 for unlimited.
+# journal_size_limit_bytes = 1073741824
+# SQLite page cache size in KiB for writes (PRAGMA cache_size).
+# Negative values represent size in KiB; positive values represent number of pages.
+# Defaults to -1048576 (-1 GiB).
+# cache_size_kib = -1048576
 
 [gossip]
 addr = "[::]:8787"

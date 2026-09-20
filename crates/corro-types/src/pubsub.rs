@@ -2589,7 +2589,13 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1)), -1048576).await?;
+        let pool = SplitPool::create(
+            db_path,
+            Arc::new(Semaphore::new(1)),
+            crate::config::DEFAULT_CACHE_SIZE_KIB,
+            crate::config::DEFAULT_MMAP_SIZE_BYTES,
+            crate::config::DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+        ).await?;
         let clock = Arc::new(uhlc::HLC::default());
 
         {
@@ -2709,9 +2715,15 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)), -1048576)
-            .await
-            .unwrap();
+        let pool = SplitPool::create(
+            &db_path,
+            Arc::new(Semaphore::new(1)),
+            crate::config::DEFAULT_CACHE_SIZE_KIB,
+            crate::config::DEFAULT_MMAP_SIZE_BYTES,
+            crate::config::DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
+        )
+        .await
+        .unwrap();
         let mut conn = pool.write_priority().await.unwrap();
         let clock = Arc::new(uhlc::HLC::default());
         {
