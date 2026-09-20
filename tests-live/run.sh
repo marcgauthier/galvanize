@@ -13,6 +13,8 @@ encryption_write_seconds=${GALVANIZE_LIVE_ENCRYPTION_WRITE_SECONDS:-60}
 encryption_settle_seconds=${GALVANIZE_LIVE_ENCRYPTION_SETTLE_SECONDS:-10}
 highlow_write_seconds=${GALVANIZE_LIVE_HIGHLOW_WRITE_SECONDS:-300}
 highlow_settle_seconds=${GALVANIZE_LIVE_HIGHLOW_SETTLE_SECONDS:-15}
+partition_write_seconds=${GALVANIZE_LIVE_PARTITION_WRITE_SECONDS:-30}
+partition_settle_seconds=${GALVANIZE_LIVE_PARTITION_SETTLE_SECONDS:-15}
 started_at=$SECONDS
 
 [[ -x "$binary" ]] || { echo "build first: cargo build -p corrosion" >&2; exit 2; }
@@ -51,6 +53,44 @@ write_node() {
   cat >"$node/schema/live.sql" <<'SQL'
 CREATE TABLE IF NOT EXISTS live_records (
   id INTEGER PRIMARY KEY NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+SQL
+  cat >"$node/config.toml" <<EOF
+[db]
+path = "$node/corrosion.db"
+schema_paths = ["$node/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "$pg"
+[gossip]
+addr = "$gossip"
+client_addr_v4 = "${gossip%:*}:0"
+bootstrap = $bootstrap
+plaintext = true
+allow-list = $allow
+[admin]
+path = "$node/admin.sock"
+[log]
+format = "json"
+EOF
+  GALVANIZE_DB_KEY="$key" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+    "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+}
+
+start_node_instance() {
+  local node=$1 gossip=$2 pg=$3 bootstrap=$4 key=$5 allow=$6
+  local label=${node##*/node-}
+  mkdir -p "$node/schema" "$node/logs"
+  echo "  START  node ${label^^}  pg=$pg gossip=$gossip allow=$allow"
+  cat >"$node/schema/live.sql" <<'SQL'
+CREATE TABLE IF NOT EXISTS live_records (
+  id INTEGER PRIMARY KEY NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
   value TEXT NOT NULL DEFAULT ''
 ) WITHOUT ROWID;
 SQL
@@ -584,11 +624,169 @@ EOF
   finish "$runtime" 0
 }
 
+partition() {
+  local runtime="$runtime_root/partition"
+  rm -rf "$runtime"; mkdir -p "$runtime"; active_runtime=$runtime
+  echo "== partition: 4-node cluster network partition & split-brain reconciliation =="
+  echo "  TOPOLOGY  4 Nodes: A (127.0.0.51), B (127.0.0.52), C (127.0.0.53), D (127.0.0.54)"
+  echo "  PLAN      Phase 1: Baseline mesh -> Phase 2: Partition {A,B} vs {C,D} (${partition_write_seconds}s) -> Phase 3: Heal & Reconcile"
+
+  local key_a="galv-part-key-a" key_b="galv-part-key-b" key_c="galv-part-key-c" key_d="galv-part-key-d"
+  local node_a="$runtime/node-a" node_b="$runtime/node-b" node_c="$runtime/node-c" node_d="$runtime/node-d"
+
+  # Phase 1: Baseline Mesh
+  echo "  PHASE 1: Starting all 4 nodes in full mesh"
+  start_node_instance "$node_a" 127.0.0.51:48051 127.0.0.1:54951 '["127.0.0.52:48052", "127.0.0.53:48053", "127.0.0.54:48054"]' "$key_a" '["*"]'
+  start_node_instance "$node_b" 127.0.0.52:48052 127.0.0.1:54952 '["127.0.0.51:48051", "127.0.0.53:48053", "127.0.0.54:48054"]' "$key_b" '["*"]'
+  start_node_instance "$node_c" 127.0.0.53:48053 127.0.0.1:54953 '["127.0.0.51:48051", "127.0.0.52:48052", "127.0.0.54:48054"]' "$key_c" '["*"]'
+  start_node_instance "$node_d" 127.0.0.54:48054 127.0.0.1:54954 '["127.0.0.51:48051", "127.0.0.52:48052", "127.0.0.53:48053"]' "$key_d" '["*"]'
+
+  wait_node 54951; wait_node 54952; wait_node 54953; wait_node 54954
+
+  echo "  WRITE  writing 5 baseline rows per node (20 total rows)"
+  local i
+  for ((i = 1; i <= 5; i++)); do
+    psql "postgresql://postgres@127.0.0.1:54951/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((i * 10 + 1)), 'base-a', 'val-base-a-$i');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54952/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((i * 10 + 2)), 'base-b', 'val-base-b-$i');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54953/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((i * 10 + 3)), 'base-c', 'val-base-c-$i');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54954/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((i * 10 + 4)), 'base-d', 'val-base-d-$i');" >/dev/null
+  done
+
+  sleep 3
+  local base_count_a base_count_b base_count_c base_count_d
+  base_count_a=$(psql "postgresql://postgres@127.0.0.1:54951/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  base_count_b=$(psql "postgresql://postgres@127.0.0.1:54952/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  base_count_c=$(psql "postgresql://postgres@127.0.0.1:54953/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  base_count_d=$(psql "postgresql://postgres@127.0.0.1:54954/postgres" -Atqc 'SELECT count(*) FROM live_records')
+
+  [[ $base_count_a == "20" && $base_count_b == "20" && $base_count_c == "20" && $base_count_d == "20" ]] || { echo "Baseline convergence failed; expected 20 rows on all nodes" >&2; return 1; }
+  echo "  CHECK  Phase 1 baseline converged (20 rows on all 4 nodes)"
+
+  # Phase 2: Inject Network Partition {A, B} vs {C, D}
+  echo "  PHASE 2: Injecting partition: Partition 1 {A, B} isolated from Partition 2 {C, D}"
+  stop_all_nodes
+
+  start_node_instance "$node_a" 127.0.0.51:48051 127.0.0.1:54951 '["127.0.0.52:48052"]' "$key_a" '["127.0.0.51", "127.0.0.52"]'
+  start_node_instance "$node_b" 127.0.0.52:48052 127.0.0.1:54952 '["127.0.0.51:48051"]' "$key_b" '["127.0.0.51", "127.0.0.52"]'
+  start_node_instance "$node_c" 127.0.0.53:48053 127.0.0.1:54953 '["127.0.0.54:48054"]' "$key_c" '["127.0.0.53", "127.0.0.54"]'
+  start_node_instance "$node_d" 127.0.0.54:48054 127.0.0.1:54954 '["127.0.0.53:48053"]' "$key_d" '["127.0.0.53", "127.0.0.54"]'
+
+  wait_node 54951; wait_node 54952; wait_node 54953; wait_node 54954
+
+  echo "  WRITE  writing concurrent partitioned records for ${partition_write_seconds}s"
+  local second tick_started
+  for ((second = 1; second <= partition_write_seconds; second++)); do
+    tick_started=$SECONDS
+    # Partition 1 writes (A & B)
+    psql "postgresql://postgres@127.0.0.1:54951/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((1000 + second * 10 + 1)), 'part-1-a', 'val-1-a-$second');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54952/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((1000 + second * 10 + 2)), 'part-1-b', 'val-1-b-$second');" >/dev/null
+
+    # Partition 2 writes (C & D)
+    psql "postgresql://postgres@127.0.0.1:54953/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((2000 + second * 10 + 1)), 'part-2-c', 'val-2-c-$second');" >/dev/null
+    psql "postgresql://postgres@127.0.0.1:54954/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES ($((2000 + second * 10 + 2)), 'part-2-d', 'val-2-d-$second');" >/dev/null
+
+    if (( second == 1 || second % 10 == 0 || second == partition_write_seconds )); then
+      echo "  WRITE  second=$second/${partition_write_seconds} partitioned commits: P1(A,B)=$((second * 2)) P2(C,D)=$((second * 2))"
+    fi
+    local remaining=$((1 - (SECONDS - tick_started)))
+    (( remaining > 0 )) && sleep "$remaining"
+  done
+
+  echo "  PAUSE  partition writes stopped; waiting 5s for intra-partition sync"
+  sleep 5
+
+  local p1_expected=$((20 + partition_write_seconds * 2))
+  local p2_expected=$((20 + partition_write_seconds * 2))
+
+  local count_p1_a count_p1_b count_p2_c count_p2_d
+  count_p1_a=$(psql "postgresql://postgres@127.0.0.1:54951/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  count_p1_b=$(psql "postgresql://postgres@127.0.0.1:54952/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  count_p2_c=$(psql "postgresql://postgres@127.0.0.1:54953/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  count_p2_d=$(psql "postgresql://postgres@127.0.0.1:54954/postgres" -Atqc 'SELECT count(*) FROM live_records')
+
+  local hash_p1_a hash_p1_b hash_p2_c hash_p2_d
+  hash_p1_a=$(psql "postgresql://postgres@127.0.0.1:54951/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_p1_b=$(psql "postgresql://postgres@127.0.0.1:54952/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_p2_c=$(psql "postgresql://postgres@127.0.0.1:54953/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_p2_d=$(psql "postgresql://postgres@127.0.0.1:54954/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+
+  echo "  COMPARE Partition 1 rows: A=$count_p1_a B=$count_p1_b (expected $p1_expected, sha256=$hash_p1_a)"
+  echo "  COMPARE Partition 2 rows: C=$count_p2_c D=$count_p2_d (expected $p2_expected, sha256=$hash_p2_c)"
+
+  [[ $count_p1_a == "$p1_expected" && $count_p1_b == "$p1_expected" && $hash_p1_a == "$hash_p1_b" ]] || { echo "Partition 1 intra-sync mismatch" >&2; return 1; }
+  [[ $count_p2_c == "$p2_expected" && $count_p2_d == "$p2_expected" && $hash_p2_c == "$hash_p2_d" ]] || { echo "Partition 2 intra-sync mismatch" >&2; return 1; }
+  [[ $hash_p1_a != "$hash_p2_c" ]] || { echo "Partitions were not isolated" >&2; return 1; }
+
+  echo "  CHECK  Partitions remained strictly isolated with independent intra-partition replication"
+
+  # Phase 3: Heal Network Partition
+  echo "  PHASE 3: Healing partition: Reconnecting all 4 nodes into full unified mesh"
+  stop_all_nodes
+
+  start_node_instance "$node_a" 127.0.0.51:48051 127.0.0.1:54951 '["127.0.0.52:48052", "127.0.0.53:48053", "127.0.0.54:48054"]' "$key_a" '["*"]'
+  start_node_instance "$node_b" 127.0.0.52:48052 127.0.0.1:54952 '["127.0.0.51:48051", "127.0.0.53:48053", "127.0.0.54:48054"]' "$key_b" '["*"]'
+  start_node_instance "$node_c" 127.0.0.53:48053 127.0.0.1:54953 '["127.0.0.51:48051", "127.0.0.52:48052", "127.0.0.54:48054"]' "$key_c" '["*"]'
+  start_node_instance "$node_d" 127.0.0.54:48054 127.0.0.1:54954 '["127.0.0.51:48051", "127.0.0.52:48052", "127.0.0.53:48053"]' "$key_d" '["*"]'
+
+  wait_node 54951; wait_node 54952; wait_node 54953; wait_node 54954
+
+  # Phase 4: Settle & Reconcile
+  echo "  PAUSE  waiting ${partition_settle_seconds}s for anti-entropy bi-stream sync across former partition boundary"
+  for ((second = partition_settle_seconds; second > 0; second--)); do
+    if (( second == partition_settle_seconds || second % 5 == 0 || second == 1 )); then
+      echo "  PAUSE  ${second}s remaining"
+    fi
+    sleep 1
+  done
+
+  # Phase 5: Verification of Full Reconciliation
+  local total_expected=$((20 + partition_write_seconds * 4))
+  local healed_count_a healed_count_b healed_count_c healed_count_d
+  healed_count_a=$(psql "postgresql://postgres@127.0.0.1:54951/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  healed_count_b=$(psql "postgresql://postgres@127.0.0.1:54952/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  healed_count_c=$(psql "postgresql://postgres@127.0.0.1:54953/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  healed_count_d=$(psql "postgresql://postgres@127.0.0.1:54954/postgres" -Atqc 'SELECT count(*) FROM live_records')
+
+  local healed_hash_a healed_hash_b healed_hash_c healed_hash_d
+  healed_hash_a=$(psql "postgresql://postgres@127.0.0.1:54951/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  healed_hash_b=$(psql "postgresql://postgres@127.0.0.1:54952/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  healed_hash_c=$(psql "postgresql://postgres@127.0.0.1:54953/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  healed_hash_d=$(psql "postgresql://postgres@127.0.0.1:54954/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+
+  echo "  COMPARE Reconciled counts: A=$healed_count_a B=$healed_count_b C=$healed_count_c D=$healed_count_d (expected $total_expected)"
+  echo "  COMPARE Reconciled sha256 A=$healed_hash_a"
+  echo "  COMPARE Reconciled sha256 B=$healed_hash_b"
+  echo "  COMPARE Reconciled sha256 C=$healed_hash_c"
+  echo "  COMPARE Reconciled sha256 D=$healed_hash_d"
+
+  [[ $healed_count_a == "$total_expected" && $healed_count_b == "$total_expected" && $healed_count_c == "$total_expected" && $healed_count_d == "$total_expected" ]] || { echo "Healed row-count mismatch" >&2; return 1; }
+  [[ $healed_hash_a == "$healed_hash_b" && $healed_hash_b == "$healed_hash_c" && $healed_hash_c == "$healed_hash_d" ]] || { echo "Healed database contents differ across nodes" >&2; return 1; }
+
+  echo "  CHECK  All 4 nodes successfully reconciled all partitioned data with identical SHA-256 state"
+
+  # Post-heal live writes to confirm normal ongoing operation
+  echo "  WRITE  post-heal verification writes on all 4 nodes"
+  psql "postgresql://postgres@127.0.0.1:54951/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (99901, 'post-a', 'val-post-a');" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:54952/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (99902, 'post-b', 'val-post-b');" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:54953/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (99903, 'post-c', 'val-post-c');" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:54954/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (99904, 'post-d', 'val-post-d');" >/dev/null
+
+  sleep 3
+  local final_count_d
+  final_count_d=$(psql "postgresql://postgres@127.0.0.1:54954/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  [[ $final_count_d == "$((total_expected + 4))" ]] || { echo "Post-heal live write propagation failed" >&2; return 1; }
+  echo "  CHECK  Post-heal cluster operation verified ($((total_expected + 4)) total rows)"
+
+  stop_all_nodes
+  finish "$runtime" 0
+}
+
 case "$scenario" in
   encryption) encryption ;;
   rekey) rekey ;;
   allow-nodes) allow_nodes ;;
   highlow) highlow ;;
-  all) encryption; rekey; allow_nodes; highlow ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|all}" >&2; exit 2 ;;
+  partition) partition ;;
+  all) encryption; rekey; allow_nodes; highlow; partition ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|all}" >&2; exit 2 ;;
 esac

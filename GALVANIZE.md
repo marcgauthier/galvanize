@@ -58,7 +58,8 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
   - Discovery filtering in `spawn_swim_announcer`.
 
 ### 7. Live PostgreSQL-Wire Node Tests
-- **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|all}` after `cargo build -p corrosion`.
+- **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|partition|all}` after `cargo build -p corrosion`.
 - **Behavior:** each scenario creates isolated `node-*` folders, starts real Galvanize agents, and makes all application SQL requests through PostgreSQL wire listeners using `psql`.
 - **Retention:** successful runtime directories are removed. Failed runs are moved to `tests-live/failures/` with encrypted databases and agent logs for diagnosis.
 - **High/Low:** the runner executes a full 5-minute ($300\text{s}$) 5-node scenario (3 Low nodes mesh with 1 gateway exporter $\rightarrow$ air-gap staging $\rightarrow$ 2 High nodes mesh with 1 gateway receiver). It validates continuous concurrent PostgreSQL writes from all nodes, one-way air-gap transfer, mesh convergence, High-side data non-overwriting/preservation, and mutation propagation.
+- **Partition:** 4-node cluster split-brain test ({A, B} vs {C, D}) testing concurrent partitioned writes, intra-partition isolation and replication, network partition healing, and automatic anti-entropy bi-stream reconciliation to identical SHA-256 state across all 4 nodes.
