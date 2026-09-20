@@ -1212,6 +1212,380 @@ crdt_contention() {
   finish "$runtime" 0
 }
 
+highlow_faults() {
+  local runtime="$runtime_root/highlow-faults"
+  rm -rf "$runtime"; mkdir -p "$runtime/staging" "$runtime/hold"; active_runtime=$runtime
+  echo "== highlow-faults: Air-Gap Fault Injection & Ingestion Resiliency =="
+  echo "  TOPOLOGY  Low Domain: 1 Node (Low-1 is Air-Gap Exporter)"
+  echo "            High Domain: 2 Nodes (High-1 is Air-Gap Receiver, High-2 is Peer)"
+  echo "            Air-Gap: Staging directory with fault injection"
+
+  # 1. Generate RSA keypair for High node
+  openssl genpkey -algorithm RSA -out "$runtime/high_rsa_priv.pem" -pkeyopt rsa_keygen_bits:2048 2>/dev/null
+  openssl rsa -in "$runtime/high_rsa_priv.pem" -pubout -out "$runtime/high_rsa_pub.pem" 2>/dev/null
+
+  # 2. Generate Ed25519 signing key for Low node
+  local keys_out
+  keys_out=$(python3 -c "
+from cryptography.hazmat.primitives.asymmetric import ed25519
+priv = ed25519.Ed25519PrivateKey.generate()
+print(priv.private_bytes_raw().hex())
+print(priv.public_key().public_bytes_raw().hex())
+")
+  local low_priv_hex low_pub_hex
+  low_priv_hex=$(echo "$keys_out" | head -n1)
+  low_pub_hex=$(echo "$keys_out" | tail -n1)
+
+  local staging_endpoint="$runtime/staging"
+  local low_staging_endpoint="$runtime/low_staging"
+  local hold_endpoint="$runtime/hold"
+  mkdir -p "$staging_endpoint" "$low_staging_endpoint" "$hold_endpoint"
+  local rsa_pub_content rsa_priv_content
+  rsa_pub_content=$(cat "$runtime/high_rsa_pub.pem")
+  rsa_priv_content=$(cat "$runtime/high_rsa_priv.pem")
+
+  local common_schema="CREATE TABLE IF NOT EXISTS live_records (
+  id INTEGER PRIMARY KEY NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;"
+
+  # Write Low Node 1 (Exporter)
+  local node_low_1="$runtime/node-low-1"
+  mkdir -p "$node_low_1/schema" "$node_low_1/logs"
+  echo "$common_schema" >"$node_low_1/schema/live.sql"
+  cat >"$node_low_1/config.toml" <<EOF
+[db]
+path = "$node_low_1/corrosion.db"
+schema_paths = ["$node_low_1/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54981"
+[gossip]
+addr = "127.0.0.1:48081"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = []
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_low_1/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$low_staging_endpoint"
+[highlow.low]
+stream-id = "stream-fault-1"
+network-name = "net-fault"
+upload-interval-seconds = 1
+recipient-key-id = "high-rsa-key"
+recipient-rsa-public-key-env = "GALV_TEST_RSA_PUB"
+sender-signing-key-env = "GALV_TEST_ED25519_KEY"
+EOF
+
+  # Write High Node 1 (Receiver Gateway)
+  local node_high_1="$runtime/node-high-1"
+  mkdir -p "$node_high_1/schema" "$node_high_1/logs"
+  echo "$common_schema" >"$node_high_1/schema/live.sql"
+  cat >"$node_high_1/config.toml" <<EOF
+[db]
+path = "$node_high_1/corrosion.db"
+schema_paths = ["$node_high_1/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54982"
+[gossip]
+addr = "127.0.0.1:48082"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48083"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_high_1/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$staging_endpoint"
+[highlow.high]
+accepted-streams = ["stream-fault-1"]
+download-interval-seconds = 1
+recipient-key-id = "high-rsa-key"
+recipient-rsa-private-key-env = "GALV_TEST_RSA_PRIV"
+permitted-sender-key-envs = ["GALV_TEST_PERMITTED_SENDER"]
+EOF
+
+  # Write High Node 2 (High Cluster Peer)
+  local node_high_2="$runtime/node-high-2"
+  mkdir -p "$node_high_2/schema" "$node_high_2/logs"
+  echo "$common_schema" >"$node_high_2/schema/live.sql"
+  cat >"$node_high_2/config.toml" <<EOF
+[db]
+path = "$node_high_2/corrosion.db"
+schema_paths = ["$node_high_2/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54983"
+[gossip]
+addr = "127.0.0.1:48083"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48082"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_high_2/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+EOF
+
+  echo "  START  Starting Low exporter and High receiver cluster"
+  GALVANIZE_DB_KEY="galv-fault-low-1" \
+    GALV_TEST_RSA_PUB="$rsa_pub_content" \
+    GALV_TEST_ED25519_KEY="$low_priv_hex" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_low_1/config.toml" agent >"$node_low_1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  GALVANIZE_DB_KEY="galv-fault-high-1" \
+    GALV_TEST_RSA_PRIV="$rsa_priv_content" \
+    GALV_TEST_PERMITTED_SENDER="$low_pub_hex" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_high_1/config.toml" agent >"$node_high_1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  GALVANIZE_DB_KEY="galv-fault-high-2" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_high_2/config.toml" agent >"$node_high_2/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  wait_node 54981; wait_node 54982; wait_node 54983
+
+  # Fault 1: Payload Byte Corruption
+  echo "  FAULT 1: Payload corruption injection (corrupted SHA-256 / MAC)"
+  psql "postgresql://postgres@127.0.0.1:54981/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (101, 'low-1', 'val-corrupt-payload');" >/dev/null
+
+  local deadline=$((SECONDS + timeout_seconds))
+  local payload_src='' manifest_src=''
+  while (( SECONDS < deadline )); do
+    payload_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.zstd.galvh' | head -n1 || true)
+    manifest_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.json.galv' | head -n1 || true)
+    [[ -n "$payload_src" && -n "$manifest_src" ]] && break
+    sleep 0.2
+  done
+  [[ -n "$payload_src" && -n "$manifest_src" ]] || { echo "Low exporter did not produce bundle files in low_staging" >&2; return 1; }
+
+  local payload_base manifest_base
+  payload_base=$(basename "$payload_src")
+  manifest_base=$(basename "$manifest_src")
+
+  # Copy payload and manifest to staging, with corrupted payload bytes
+  cp "$payload_src" "$staging_endpoint/$payload_base"
+  printf '\x00\xff\x00\xff\x00\xff' | dd of="$staging_endpoint/$payload_base" conv=notrunc bs=1 count=6 seek=30 2>/dev/null
+  cp "$manifest_src" "$staging_endpoint/$manifest_base"
+  echo "  CORRUPT Staged payload $payload_base with corrupted byte sequence"
+
+  rm -f "$payload_src" "$manifest_src"
+  sleep 3
+
+  local count_101_high1 count_101_high2
+  count_101_high1=$(psql "postgresql://postgres@127.0.0.1:54982/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 101')
+  count_101_high2=$(psql "postgresql://postgres@127.0.0.1:54983/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 101')
+  [[ "$count_101_high1" == "0" && "$count_101_high2" == "0" ]] || { echo "Corrupted payload 101 was improperly applied to High database" >&2; return 1; }
+  echo "  CHECK  Fault 1 verified: Corrupted payload safely rejected (0 rows applied on High)"
+
+  rm -f "$staging_endpoint"/*
+
+  # Fault 2: Manifest Signature Tampering
+  echo "  FAULT 2: Manifest signature tampering injection (invalid Ed25519 signature)"
+  psql "postgresql://postgres@127.0.0.1:54981/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (102, 'low-1', 'val-tampered-sig');" >/dev/null
+
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    payload_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.zstd.galvh' | head -n1 || true)
+    manifest_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.json.galv' | head -n1 || true)
+    [[ -n "$payload_src" && -n "$manifest_src" ]] && break
+    sleep 0.2
+  done
+  [[ -n "$payload_src" && -n "$manifest_src" ]] || { echo "Low exporter did not produce bundle 2 in low_staging" >&2; return 1; }
+
+  payload_base=$(basename "$payload_src")
+  manifest_base=$(basename "$manifest_src")
+
+  # Copy payload cleanly to staging
+  cp "$payload_src" "$staging_endpoint/$payload_base"
+
+  # Tamper signature in manifest before staging it
+  jq '.signature = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"' "$manifest_src" > "$staging_endpoint/$manifest_base"
+  echo "  TAMPER Staged manifest $manifest_base with forged signature"
+
+  rm -f "$payload_src" "$manifest_src"
+  sleep 3
+
+  local count_102_high1 count_102_high2
+  count_102_high1=$(psql "postgresql://postgres@127.0.0.1:54982/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 102')
+  count_102_high2=$(psql "postgresql://postgres@127.0.0.1:54983/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 102')
+  [[ "$count_102_high1" == "0" && "$count_102_high2" == "0" ]] || { echo "Tampered signature bundle 102 was improperly applied to High database" >&2; return 1; }
+  echo "  CHECK  Fault 2 verified: Tampered signature bundle safely rejected (0 rows applied on High)"
+
+  rm -f "$staging_endpoint"/*
+
+  # Fault 3: Replay Idempotency
+  echo "  FAULT 3: Replay attack & duplicate bundle delivery"
+  psql "postgresql://postgres@127.0.0.1:54981/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (103, 'low-1', 'val-valid-replay');" >/dev/null
+
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    payload_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.zstd.galvh' | head -n1 || true)
+    manifest_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.json.galv' | head -n1 || true)
+    [[ -n "$payload_src" && -n "$manifest_src" ]] && break
+    sleep 0.2
+  done
+  [[ -n "$payload_src" && -n "$manifest_src" ]] || { echo "Low exporter did not produce bundle 3 in low_staging" >&2; return 1; }
+
+  payload_base=$(basename "$payload_src")
+  manifest_base=$(basename "$manifest_src")
+
+  # Save clean copies to hold directory
+  cp "$payload_src" "$hold_endpoint/$payload_base"
+  cp "$manifest_src" "$hold_endpoint/$manifest_base"
+
+  # Deliver cleanly to staging
+  cp "$payload_src" "$staging_endpoint/$payload_base"
+  cp "$manifest_src" "$staging_endpoint/$manifest_base"
+  rm -f "$payload_src" "$manifest_src"
+
+  # Wait for High-1 to ingest valid row 103
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c103
+    c103=$(psql "postgresql://postgres@127.0.0.1:54982/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 103' 2>/dev/null || echo 0)
+    [[ "$c103" == "1" ]] && break
+    sleep 0.5
+  done
+  echo "  INGEST Valid bundle 103 successfully ingested on High-1"
+
+  # Trigger duplicate bundle replay delivery
+  cp "$hold_endpoint/$payload_base" "$staging_endpoint/$payload_base"
+  cp "$hold_endpoint/$manifest_base" "$staging_endpoint/$manifest_base"
+  echo "  REPLAY Delivered duplicate bundle 103 files into staging"
+  sleep 3
+
+  local count_103_high1 count_103_high2
+  count_103_high1=$(psql "postgresql://postgres@127.0.0.1:54982/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 103')
+  count_103_high2=$(psql "postgresql://postgres@127.0.0.1:54983/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 103')
+  [[ "$count_103_high1" == "1" && "$count_103_high2" == "1" ]] || { echo "Replayed bundle caused duplicate row or replication failure" >&2; return 1; }
+  echo "  CHECK  Fault 3 verified: Duplicate bundle re-delivery idempotently handled (exactly 1 row present)"
+
+  rm -f "$staging_endpoint"/*
+
+  # Fault 4: Sequence Gap & Healing
+  echo "  FAULT 4: Out-of-order delivery & sequence gap healing"
+  psql "postgresql://postgres@127.0.0.1:54981/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (104, 'low-1', 'val-gap-seq-4');" >/dev/null
+
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    payload_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.zstd.galvh' | head -n1 || true)
+    manifest_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.json.galv' | head -n1 || true)
+    [[ -n "$payload_src" && -n "$manifest_src" ]] && break
+    sleep 0.2
+  done
+  [[ -n "$payload_src" && -n "$manifest_src" ]] || { echo "Low exporter did not produce bundle 4 in low_staging" >&2; return 1; }
+
+  local p4_base m4_base
+  p4_base=$(basename "$payload_src")
+  m4_base=$(basename "$manifest_src")
+
+  # Move bundle 4 to hold (withhold from staging)
+  mv "$payload_src" "$hold_endpoint/$p4_base"
+  mv "$manifest_src" "$hold_endpoint/$m4_base"
+  echo "  WITHHOLD Sequence 4 withheld in hold directory"
+
+  # Produce bundle 5 on Low
+  psql "postgresql://postgres@127.0.0.1:54981/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (105, 'low-1', 'val-gap-seq-5');" >/dev/null
+
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    payload_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.zstd.galvh' | head -n1 || true)
+    manifest_src=$(find "$low_staging_endpoint" -maxdepth 1 -name '*.json.galv' | head -n1 || true)
+    [[ -n "$payload_src" && -n "$manifest_src" ]] && break
+    sleep 0.2
+  done
+  [[ -n "$payload_src" && -n "$manifest_src" ]] || { echo "Low exporter did not produce bundle 5 in low_staging" >&2; return 1; }
+
+  local p5_base m5_base
+  p5_base=$(basename "$payload_src")
+  m5_base=$(basename "$manifest_src")
+
+  # Stage bundle 5 ahead of bundle 4
+  cp "$payload_src" "$staging_endpoint/$p5_base"
+  cp "$manifest_src" "$staging_endpoint/$m5_base"
+  rm -f "$payload_src" "$manifest_src"
+  echo "  STAGE Staged out-of-order sequence 5 ($m5_base)"
+
+  # Wait for High to ingest sequence 5
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c105
+    c105=$(psql "postgresql://postgres@127.0.0.1:54982/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 105' 2>/dev/null || echo 0)
+    [[ "$c105" == "1" ]] && break
+    sleep 0.5
+  done
+  echo "  INGEST Sequence 5 ingested on High-1 (gap recorded in streams)"
+
+  # Now deliver the withheld sequence 4 to heal the stream
+  cp "$hold_endpoint/$p4_base" "$staging_endpoint/$p4_base"
+  cp "$hold_endpoint/$m4_base" "$staging_endpoint/$m4_base"
+  echo "  HEAL Staged withheld sequence 4 ($m4_base) to heal stream"
+
+  # Wait for row 104 to be ingested on High
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c104
+    c104=$(psql "postgresql://postgres@127.0.0.1:54982/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 104' 2>/dev/null || echo 0)
+    [[ "$c104" == "1" ]] && break
+    sleep 0.5
+  done
+  echo "  INGEST Sequence 4 ingested on High-1 (stream gap healed)"
+
+  # Phase 6: Final Verification Across High Cluster
+  sleep 3
+  local count_high1 count_high2 hash_high1 hash_high2
+  count_high1=$(psql "postgresql://postgres@127.0.0.1:54982/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  count_high2=$(psql "postgresql://postgres@127.0.0.1:54983/postgres" -Atqc 'SELECT count(*) FROM live_records')
+
+  hash_high1=$(psql "postgresql://postgres@127.0.0.1:54982/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_high2=$(psql "postgresql://postgres@127.0.0.1:54983/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+
+  echo "  COMPARE High-1 rows=$count_high1 sha256=$hash_high1"
+  echo "  COMPARE High-2 rows=$count_high2 sha256=$hash_high2"
+
+  # Expected rows in High database: exactly 3 rows (103, 104, 105). 101 and 102 must be 0!
+  [[ "$count_high1" == "3" && "$count_high2" == "3" ]] || { echo "High cluster row count mismatch; expected 3 rows (103, 104, 105)" >&2; return 1; }
+  [[ "$hash_high1" == "$hash_high2" ]] || { echo "High cluster nodes differ in database contents" >&2; return 1; }
+
+  echo "  CHECK  All High/Low air-gap fault invariants verified across High mesh"
+
+  stop_all_nodes
+  finish "$runtime" 0
+}
+
+
 case "$scenario" in
   encryption) encryption ;;
   rekey) rekey ;;
@@ -1220,6 +1594,7 @@ case "$scenario" in
   partition) partition ;;
   crash-recovery) crash_recovery ;;
   crdt-contention) crdt_contention ;;
-  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|all}" >&2; exit 2 ;;
+  highlow-faults) highlow_faults ;;
+  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; highlow_faults ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|all}" >&2; exit 2 ;;
 esac
