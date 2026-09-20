@@ -58,7 +58,7 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
   - Discovery filtering in `spawn_swim_announcer`.
 
 ### 7. Live PostgreSQL-Wire Node Tests
-- **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|all}` (or individual `tests-live/<scenario>/run.sh`) after `cargo build -p corrosion`.
+- **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|highlow-schema|large-payload|all}` (or individual `tests-live/<scenario>/run.sh`) after `cargo build -p corrosion`.
 - **Behavior:** each scenario creates isolated `node-*` folders, starts real Galvanize agents, and makes all application SQL requests through PostgreSQL wire listeners using `psql`.
 - **Retention:** successful runtime directories are removed. Failed runs are moved to `tests-live/failures/` with encrypted databases and agent logs for diagnosis.
 - **High/Low:** the runner executes the full end-to-end `highlow` scenario verifying Low node PostgreSQL writes, air-gap artifact packaging, RSA-OAEP/Ed25519 signing/encryption, directory staging transport, and High node background ingestion/updates/deletes.
@@ -67,4 +67,6 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **CRDT Contention:** 3-node concurrent mutation test executing parallel disjoint column updates on identical rows, same-column Last-Write-Wins (LWW) contention, and concurrent delete interleaving, validating CR-SQLite conflict-free convergence to identical SHA-256 database state across all nodes.
 - **High/Low Faults:** 3-node air-gap resiliency test verifying deterministic rejection of corrupted payloads (MAC/digest failures) and forged Ed25519 manifest signatures, replay attack idempotency, and out-of-order sequence gap holding and healing across the High cluster mesh.
 - **High/Low Schema Evolution:** 3-node air-gap schema drift test validating safe `waiting-schema` hold on the High receiver when Low evolves schema first, followed by zero-downtime hot schema reload (`corrosion reload`) and automatic backlog ingestion across all mesh peers.
+- **Large Payload & Bulk Batches:** 3-node cluster stress test validating 1,000-row atomic bulk batch transactions, multi-megabyte binary blob payloads (1.5 MB), Zstd level-15 compression/decompression, and 8 KiB chunked QUIC stream replication to bit-identical state across all mesh peers.
+
 

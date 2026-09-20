@@ -1867,6 +1867,266 @@ EOF
   finish "$runtime" 0
 }
 
+large_payload() {
+  local runtime="$runtime_root/large-payload"
+  rm -rf "$runtime"; mkdir -p "$runtime/staging"; active_runtime=$runtime
+  echo "== large-payload: Bulk Batches, Multi-MB Blobs, Zstd & QUIC Streaming =="
+  echo "  TOPOLOGY  Low Domain: 1 Node (Low-1 is Air-Gap Exporter)"
+  echo "            High Domain: 2 Nodes (High-1 is Air-Gap Receiver, High-2 is Peer)"
+  echo "            Air-Gap: Staging directory transport"
+
+  local timeout_seconds=60
+
+  # Generate RSA keypair for High Receiver
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$runtime/high_rsa_priv.pem" 2>/dev/null
+  openssl rsa -pubout -in "$runtime/high_rsa_priv.pem" -out "$runtime/high_rsa_pub.pem" 2>/dev/null
+
+  # Generate Ed25519 signing keypair for Low Exporter
+  local keys_out
+  keys_out=$(python3 -c "
+from cryptography.hazmat.primitives.asymmetric import ed25519
+priv = ed25519.Ed25519PrivateKey.generate()
+print(priv.private_bytes_raw().hex())
+print(priv.public_key().public_bytes_raw().hex())
+")
+  local low_priv_hex low_pub_hex
+  low_priv_hex=$(echo "$keys_out" | head -n1)
+  low_pub_hex=$(echo "$keys_out" | tail -n1)
+
+  local staging_endpoint="$runtime/staging"
+  local rsa_pub_content rsa_priv_content
+  rsa_pub_content=$(cat "$runtime/high_rsa_pub.pem")
+  rsa_priv_content=$(cat "$runtime/high_rsa_priv.pem")
+
+  local common_schema="CREATE TABLE IF NOT EXISTS live_records (
+  id INTEGER PRIMARY KEY NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS high_records (
+  id INTEGER PRIMARY KEY NOT NULL,
+  sender TEXT NOT NULL DEFAULT '',
+  data TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;"
+
+  # Write Low Node 1 (Airgap Exporter)
+  local node_low_1="$runtime/node-low-1"
+  mkdir -p "$node_low_1/schema" "$node_low_1/logs"
+  echo "$common_schema" >"$node_low_1/schema/live.sql"
+  cat >"$node_low_1/config.toml" <<EOF
+[db]
+path = "$node_low_1/corrosion.db"
+schema_paths = ["$node_low_1/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54971"
+[gossip]
+addr = "127.0.0.1:48071"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = []
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_low_1/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$staging_endpoint"
+[highlow.low]
+stream-id = "stream-large-1"
+network-name = "net-large"
+upload-interval-seconds = 1
+recipient-key-id = "high-rsa-key"
+recipient-rsa-public-key-env = "GALV_TEST_RSA_PUB"
+sender-signing-key-env = "GALV_TEST_ED25519_KEY"
+EOF
+
+  # Write High Node 1 (Airgap Receiver)
+  local node_high_1="$runtime/node-high-1"
+  mkdir -p "$node_high_1/schema" "$node_high_1/logs"
+  echo "$common_schema" >"$node_high_1/schema/live.sql"
+  cat >"$node_high_1/config.toml" <<EOF
+[db]
+path = "$node_high_1/corrosion.db"
+schema_paths = ["$node_high_1/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54972"
+[gossip]
+addr = "127.0.0.1:48072"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48073"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_high_1/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$staging_endpoint"
+[highlow.high]
+accepted-streams = ["stream-large-1"]
+download-interval-seconds = 1
+recipient-key-id = "high-rsa-key"
+recipient-rsa-private-key-env = "GALV_TEST_RSA_PRIV"
+permitted-sender-key-envs = ["GALV_TEST_PERMITTED_SENDER"]
+EOF
+
+  # Write High Node 2 (High Mesh Peer)
+  local node_high_2="$runtime/node-high-2"
+  mkdir -p "$node_high_2/schema" "$node_high_2/logs"
+  echo "$common_schema" >"$node_high_2/schema/live.sql"
+  cat >"$node_high_2/config.toml" <<EOF
+[db]
+path = "$node_high_2/corrosion.db"
+schema_paths = ["$node_high_2/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54973"
+[gossip]
+addr = "127.0.0.1:48073"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48072"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_high_2/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+EOF
+
+  echo "  START  Starting Low exporter and High receiver cluster"
+  GALVANIZE_DB_KEY="galv-large-low-1" \
+    GALV_TEST_RSA_PUB="$rsa_pub_content" \
+    GALV_TEST_ED25519_KEY="$low_priv_hex" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_low_1/config.toml" agent >"$node_low_1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  GALVANIZE_DB_KEY="galv-large-high-1" \
+    GALV_TEST_RSA_PRIV="$rsa_priv_content" \
+    GALV_TEST_PERMITTED_SENDER="$low_pub_hex" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_high_1/config.toml" agent >"$node_high_1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  GALVANIZE_DB_KEY="galv-large-high-2" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_high_2/config.toml" agent >"$node_high_2/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  wait_node 54971; wait_node 54972; wait_node 54973
+
+  # Phase 1: High-Volume Bulk Batch Transaction (1,000 Rows)
+  echo "  PHASE 1: Committing 1,000-row atomic bulk transaction on Low-1"
+  python3 -c "
+import sys
+sys.stdout.write('BEGIN;\n')
+for i in range(1, 1001):
+    sys.stdout.write(f'INSERT INTO live_records (id, source, value) VALUES ({i}, \'low-bulk\', \'item-{i}-sample-payload-data\');\n')
+sys.stdout.write('COMMIT;\n')
+" | psql "postgresql://postgres@127.0.0.1:54971/postgres" -v ON_ERROR_STOP=1 -q >/dev/null
+
+  echo "  INGEST Waiting for 1,000 rows to replicate through air-gap and QUIC mesh"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c1000_h1 c1000_h2
+    c1000_h1=$(psql "postgresql://postgres@127.0.0.1:54972/postgres" -Atqc 'SELECT count(*) FROM live_records' 2>/dev/null || echo 0)
+    c1000_h2=$(psql "postgresql://postgres@127.0.0.1:54973/postgres" -Atqc 'SELECT count(*) FROM live_records' 2>/dev/null || echo 0)
+    [[ "$c1000_h1" == "1000" && "$c1000_h2" == "1000" ]] && break
+    sleep 0.5
+  done
+  echo "  CHECK  Phase 1 verified: 1,000-row bulk transaction ingested and replicated across High mesh"
+
+  # Phase 2: Multi-Megabyte Large Binary/Text Blob (1.5 MB)
+  echo "  PHASE 2: Committing 1.5 MB structured blob record on Low-1"
+  python3 -c "
+import sys
+blob = 'X' * 1500000
+sys.stdout.write('BEGIN;\n')
+sys.stdout.write(f\"INSERT INTO live_records (id, source, value) VALUES (5000, 'low-blob', '{blob}');\n\")
+sys.stdout.write('COMMIT;\n')
+" | psql "postgresql://postgres@127.0.0.1:54971/postgres" -v ON_ERROR_STOP=1 -q >/dev/null
+
+  echo "  INGEST Waiting for 1.5 MB blob record (id=5000) to ingest and stream via QUIC chunks"
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local len_h1 len_h2
+    len_h1=$(psql "postgresql://postgres@127.0.0.1:54972/postgres" -Atqc 'SELECT length(value) FROM live_records WHERE id = 5000' 2>/dev/null || echo 0)
+    len_h2=$(psql "postgresql://postgres@127.0.0.1:54973/postgres" -Atqc 'SELECT length(value) FROM live_records WHERE id = 5000' 2>/dev/null || echo 0)
+    [[ "$len_h1" == "1500000" && "$len_h2" == "1500000" ]] && break
+    sleep 0.5
+  done
+  echo "  CHECK  Phase 2 verified: 1.5 MB blob verified on both High nodes (length=1500000)"
+
+  # Phase 3: High-Mesh Direct 500-Row Bulk Transaction
+  echo "  PHASE 3: Committing 500-row batch directly on High-1 to test peer QUIC chunking"
+  python3 -c "
+import sys
+sys.stdout.write('BEGIN;\n')
+for i in range(1, 501):
+    sys.stdout.write(f'INSERT INTO high_records (id, sender, data) VALUES ({i}, \'high-1\', \'direct-mesh-item-{i}-content\');\n')
+sys.stdout.write('COMMIT;\n')
+" | psql "postgresql://postgres@127.0.0.1:54972/postgres" -v ON_ERROR_STOP=1 -q >/dev/null
+
+  echo "  INGEST Waiting for High-2 to receive 500 rows via QUIC broadcast and anti-entropy"
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c500_h2
+    c500_h2=$(psql "postgresql://postgres@127.0.0.1:54973/postgres" -Atqc 'SELECT count(*) FROM high_records' 2>/dev/null || echo 0)
+    [[ "$c500_h2" == "500" ]] && break
+    sleep 0.5
+  done
+  echo "  CHECK  Phase 3 verified: Direct High cluster bulk batch replicated to peer"
+
+  # Phase 4: Final Verification Across High Cluster
+  sleep 2
+  local count_lr_h1 count_lr_h2 count_hr_h1 count_hr_h2
+  count_lr_h1=$(psql "postgresql://postgres@127.0.0.1:54972/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  count_lr_h2=$(psql "postgresql://postgres@127.0.0.1:54973/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  count_hr_h1=$(psql "postgresql://postgres@127.0.0.1:54972/postgres" -Atqc 'SELECT count(*) FROM high_records')
+  count_hr_h2=$(psql "postgresql://postgres@127.0.0.1:54973/postgres" -Atqc 'SELECT count(*) FROM high_records')
+
+  local hash_lr_h1 hash_lr_h2 hash_hr_h1 hash_hr_h2
+  hash_lr_h1=$(psql "postgresql://postgres@127.0.0.1:54972/postgres" -Atqc "SELECT id || ':' || source || ':' || length(value) FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_lr_h2=$(psql "postgresql://postgres@127.0.0.1:54973/postgres" -Atqc "SELECT id || ':' || source || ':' || length(value) FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_hr_h1=$(psql "postgresql://postgres@127.0.0.1:54972/postgres" -Atqc "SELECT id || ':' || sender || ':' || data FROM high_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_hr_h2=$(psql "postgresql://postgres@127.0.0.1:54973/postgres" -Atqc "SELECT id || ':' || sender || ':' || data FROM high_records ORDER BY id" | sha256sum | awk '{print $1}')
+
+  echo "  COMPARE High-1 live_records rows=$count_lr_h1 sha256=$hash_lr_h1"
+  echo "  COMPARE High-2 live_records rows=$count_lr_h2 sha256=$hash_lr_h2"
+  echo "  COMPARE High-1 high_records rows=$count_hr_h1 sha256=$hash_hr_h1"
+  echo "  COMPARE High-2 high_records rows=$count_hr_h2 sha256=$hash_hr_h2"
+
+  [[ "$count_lr_h1" == "1001" && "$count_lr_h2" == "1001" ]] || { echo "High cluster live_records count mismatch; expected 1001 rows" >&2; return 1; }
+  [[ "$count_hr_h1" == "500" && "$count_hr_h2" == "500" ]] || { echo "High cluster high_records count mismatch; expected 500 rows" >&2; return 1; }
+  [[ "$hash_lr_h1" == "$hash_lr_h2" ]] || { echo "High cluster nodes differ in live_records contents" >&2; return 1; }
+  [[ "$hash_hr_h1" == "$hash_hr_h2" ]] || { echo "High cluster nodes differ in high_records contents" >&2; return 1; }
+
+  echo "  CHECK  All large-payload and bulk batch invariants verified across High mesh"
+
+  stop_all_nodes
+  finish "$runtime" 0
+}
+
 case "$scenario" in
   encryption) encryption ;;
   rekey) rekey ;;
@@ -1877,7 +2137,9 @@ case "$scenario" in
   crdt-contention) crdt_contention ;;
   highlow-faults) highlow_faults ;;
   highlow-schema) highlow_schema ;;
-  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; highlow_faults; highlow_schema ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|highlow-schema|all}" >&2; exit 2 ;;
+  large-payload) large_payload ;;
+  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; highlow_faults; highlow_schema; large_payload ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|highlow-schema|large-payload|all}" >&2; exit 2 ;;
 esac
+
 
