@@ -11,6 +11,7 @@ individual feature runner:
 - `tests-live/crash-recovery/run.sh`
 - `tests-live/crdt-contention/run.sh`
 - `tests-live/highlow-faults/run.sh`
+- `tests-live/highlow-schema/run.sh`
 
 Each feature owns a `runtime/node-*` tree and uses `psql` against each node's
 PostgreSQL wire listener for application SQL. Successful runtime directories

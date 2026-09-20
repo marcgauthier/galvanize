@@ -1585,6 +1585,287 @@ EOF
   finish "$runtime" 0
 }
 
+highlow_schema() {
+  local runtime="$runtime_root/highlow-schema"
+  rm -rf "$runtime"; mkdir -p "$runtime/staging"; active_runtime=$runtime
+  echo "== highlow-schema: Air-Gap Schema Drift & waiting-schema Hold and Replay =="
+  echo "  TOPOLOGY  Low Domain: 1 Node (Low-1 is Air-Gap Exporter)"
+  echo "            High Domain: 2 Nodes (High-1 is Air-Gap Receiver, High-2 is Peer)"
+  echo "            Air-Gap: Staging directory transport"
+
+  local timeout_seconds=45
+
+  # Generate RSA keypair for High Receiver
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$runtime/high_rsa_priv.pem" 2>/dev/null
+  openssl rsa -pubout -in "$runtime/high_rsa_priv.pem" -out "$runtime/high_rsa_pub.pem" 2>/dev/null
+
+  # Generate Ed25519 signing keypair for Low Exporter
+  local keys_out
+  keys_out=$(python3 -c "
+from cryptography.hazmat.primitives.asymmetric import ed25519
+priv = ed25519.Ed25519PrivateKey.generate()
+print(priv.private_bytes_raw().hex())
+print(priv.public_key().public_bytes_raw().hex())
+")
+  local low_priv_hex low_pub_hex
+  low_priv_hex=$(echo "$keys_out" | head -n1)
+  low_pub_hex=$(echo "$keys_out" | tail -n1)
+
+  local staging_endpoint="$runtime/staging"
+  local rsa_pub_content rsa_priv_content
+  rsa_pub_content=$(cat "$runtime/high_rsa_pub.pem")
+  rsa_priv_content=$(cat "$runtime/high_rsa_priv.pem")
+
+  local schema_v1="CREATE TABLE IF NOT EXISTS live_records (
+  id INTEGER PRIMARY KEY NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  value TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;"
+
+  local schema_v2="CREATE TABLE IF NOT EXISTS metrics_records (
+  id INTEGER PRIMARY KEY NOT NULL,
+  metric_name TEXT NOT NULL DEFAULT '',
+  metric_val INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;"
+
+  # Write Low Node 1 (Airgap Exporter)
+  local node_low_1="$runtime/node-low-1"
+  mkdir -p "$node_low_1/schema" "$node_low_1/logs"
+  echo "$schema_v1" >"$node_low_1/schema/v1.sql"
+  cat >"$node_low_1/config.toml" <<EOF
+[db]
+path = "$node_low_1/corrosion.db"
+schema_paths = ["$node_low_1/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54991"
+[gossip]
+addr = "127.0.0.1:48091"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = []
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_low_1/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$staging_endpoint"
+[highlow.low]
+stream-id = "stream-schema-1"
+network-name = "net-schema"
+upload-interval-seconds = 1
+recipient-key-id = "high-rsa-key"
+recipient-rsa-public-key-env = "GALV_TEST_RSA_PUB"
+sender-signing-key-env = "GALV_TEST_ED25519_KEY"
+EOF
+
+  # Write High Node 1 (Airgap Receiver)
+  local node_high_1="$runtime/node-high-1"
+  mkdir -p "$node_high_1/schema" "$node_high_1/logs"
+  echo "$schema_v1" >"$node_high_1/schema/v1.sql"
+  cat >"$node_high_1/config.toml" <<EOF
+[db]
+path = "$node_high_1/corrosion.db"
+schema_paths = ["$node_high_1/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54992"
+[gossip]
+addr = "127.0.0.1:48092"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48093"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_high_1/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$staging_endpoint"
+[highlow.high]
+accepted-streams = ["stream-schema-1"]
+download-interval-seconds = 1
+recipient-key-id = "high-rsa-key"
+recipient-rsa-private-key-env = "GALV_TEST_RSA_PRIV"
+permitted-sender-key-envs = ["GALV_TEST_PERMITTED_SENDER"]
+EOF
+
+  # Write High Node 2 (High Mesh Peer)
+  local node_high_2="$runtime/node-high-2"
+  mkdir -p "$node_high_2/schema" "$node_high_2/logs"
+  echo "$schema_v1" >"$node_high_2/schema/v1.sql"
+  cat >"$node_high_2/config.toml" <<EOF
+[db]
+path = "$node_high_2/corrosion.db"
+schema_paths = ["$node_high_2/schema"]
+[api]
+addr = "127.0.0.1:0"
+[[api.pg]]
+addr = "127.0.0.1:54993"
+[gossip]
+addr = "127.0.0.1:48093"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48092"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_high_2/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+EOF
+
+  echo "  START  Starting Low exporter and High receiver cluster"
+  GALVANIZE_DB_KEY="galv-schema-low-1" \
+    GALV_TEST_RSA_PUB="$rsa_pub_content" \
+    GALV_TEST_ED25519_KEY="$low_priv_hex" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_low_1/config.toml" agent >"$node_low_1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  GALVANIZE_DB_KEY="galv-schema-high-1" \
+    GALV_TEST_RSA_PRIV="$rsa_priv_content" \
+    GALV_TEST_PERMITTED_SENDER="$low_pub_hex" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_high_1/config.toml" agent >"$node_high_1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  GALVANIZE_DB_KEY="galv-schema-high-2" \
+    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+    "$binary" --config "$node_high_2/config.toml" agent >"$node_high_2/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  wait_node 54991; wait_node 54992; wait_node 54993
+
+  # Phase 1: Baseline Ingestion on Schema V1
+  echo "  PHASE 1: Baseline Ingestion on Schema V1"
+  psql "postgresql://postgres@127.0.0.1:54991/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (1, 'low-1', 'val-v1-base');" >/dev/null
+
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c1
+    c1=$(psql "postgresql://postgres@127.0.0.1:54992/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 1' 2>/dev/null || echo 0)
+    [[ "$c1" == "1" ]] && break
+    sleep 0.5
+  done
+
+  # Wait for High-2 replication
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c2
+    c2=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 1' 2>/dev/null || echo 0)
+    [[ "$c2" == "1" ]] && break
+    sleep 0.5
+  done
+  echo "  INGEST Phase 1 verified: Baseline row 1 replicated across High cluster"
+
+  # Phase 2: Schema Drift on Low (V1 -> V2)
+  echo "  PHASE 2: Schema Drift on Low (adding metrics_records table & hot reload)"
+  echo "$schema_v2" >"$node_low_1/schema/v2.sql"
+  "$binary" reload --admin-path "$node_low_1/admin.sock" >/dev/null 2>&1 || true
+
+  # Insert rows on Low into both V1 and V2 tables
+  psql "postgresql://postgres@127.0.0.1:54991/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (2, 'low-1', 'val-v2-row2');" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:54991/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO metrics_records VALUES (101, 'cpu_util', 85);" >/dev/null
+
+  # Phase 3: Verify waiting-schema Hold on High
+  echo "  PHASE 3: Verifying High holds Schema V2 bundle in waiting-schema state"
+  # Let High poll staging multiple times with mismatched schema hash
+  sleep 4
+
+  local count_v2_live_h1 count_v2_live_h2
+  count_v2_live_h1=$(psql "postgresql://postgres@127.0.0.1:54992/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 2' 2>/dev/null || echo 0)
+  count_v2_live_h2=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc 'SELECT count(*) FROM live_records WHERE id = 2' 2>/dev/null || echo 0)
+  [[ "$count_v2_live_h1" == "0" && "$count_v2_live_h2" == "0" ]] || { echo "High cluster prematurely applied mismatched schema bundle" >&2; return 1; }
+  echo "  CHECK  Phase 3 verified: High safely held bundle in waiting-schema (0 unaligned rows applied)"
+
+  # Phase 4: Schema Alignment on High & Automatic Catch-Up
+  echo "  PHASE 4: Aligning High cluster schema to Schema V2 & hot reload"
+  echo "$schema_v2" >"$node_high_1/schema/v2.sql"
+  echo "$schema_v2" >"$node_high_2/schema/v2.sql"
+  "$binary" reload --admin-path "$node_high_1/admin.sock" >/dev/null 2>&1 || true
+  "$binary" reload --admin-path "$node_high_2/admin.sock" >/dev/null 2>&1 || true
+
+  # Wait for High-1 to automatically ingest the held Bundle 2
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c_m101
+    c_m101=$(psql "postgresql://postgres@127.0.0.1:54992/postgres" -Atqc 'SELECT count(*) FROM metrics_records WHERE id = 101' 2>/dev/null || echo 0)
+    [[ "$c_m101" == "1" ]] && break
+    sleep 0.5
+  done
+
+  # Wait for High-2 to replicate Bundle 2
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c_m101_h2
+    c_m101_h2=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc 'SELECT count(*) FROM metrics_records WHERE id = 101' 2>/dev/null || echo 0)
+    [[ "$c_m101_h2" == "1" ]] && break
+    sleep 0.5
+  done
+  echo "  INGEST Phase 4 verified: Held bundle automatically unblocked and ingested across High mesh"
+
+  # Phase 5: Post-Migration Writes & Continuous Sync
+  echo "  PHASE 5: Continuous writes across both tables post-alignment"
+  psql "postgresql://postgres@127.0.0.1:54991/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO live_records VALUES (3, 'low-1', 'val-v2-row3');" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:54991/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO metrics_records VALUES (102, 'mem_util', 64);" >/dev/null
+
+  # Wait for High-1 and High-2 to ingest all rows
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local c_lr c_mr
+    c_lr=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc 'SELECT count(*) FROM live_records' 2>/dev/null || echo 0)
+    c_mr=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc 'SELECT count(*) FROM metrics_records' 2>/dev/null || echo 0)
+    [[ "$c_lr" == "3" && "$c_mr" == "2" ]] && break
+    sleep 0.5
+  done
+
+  # Phase 6: Final Verification Across High Cluster
+  sleep 2
+  local count_lr_h1 count_lr_h2 count_mr_h1 count_mr_h2
+  count_lr_h1=$(psql "postgresql://postgres@127.0.0.1:54992/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  count_lr_h2=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc 'SELECT count(*) FROM live_records')
+  count_mr_h1=$(psql "postgresql://postgres@127.0.0.1:54992/postgres" -Atqc 'SELECT count(*) FROM metrics_records')
+  count_mr_h2=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc 'SELECT count(*) FROM metrics_records')
+
+  local hash_lr_h1 hash_lr_h2 hash_mr_h1 hash_mr_h2
+  hash_lr_h1=$(psql "postgresql://postgres@127.0.0.1:54992/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_lr_h2=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc "SELECT id || ':' || source || ':' || value FROM live_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_mr_h1=$(psql "postgresql://postgres@127.0.0.1:54992/postgres" -Atqc "SELECT id || ':' || metric_name || ':' || metric_val FROM metrics_records ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_mr_h2=$(psql "postgresql://postgres@127.0.0.1:54993/postgres" -Atqc "SELECT id || ':' || metric_name || ':' || metric_val FROM metrics_records ORDER BY id" | sha256sum | awk '{print $1}')
+
+  echo "  COMPARE High-1 live_records rows=$count_lr_h1 sha256=$hash_lr_h1"
+  echo "  COMPARE High-2 live_records rows=$count_lr_h2 sha256=$hash_lr_h2"
+  echo "  COMPARE High-1 metrics_records rows=$count_mr_h1 sha256=$hash_mr_h1"
+  echo "  COMPARE High-2 metrics_records rows=$count_mr_h2 sha256=$hash_mr_h2"
+
+  [[ "$count_lr_h1" == "3" && "$count_lr_h2" == "3" ]] || { echo "High cluster live_records count mismatch; expected 3 rows" >&2; return 1; }
+  [[ "$count_mr_h1" == "2" && "$count_mr_h2" == "2" ]] || { echo "High cluster metrics_records count mismatch; expected 2 rows" >&2; return 1; }
+  [[ "$hash_lr_h1" == "$hash_lr_h2" ]] || { echo "High cluster nodes differ in live_records contents" >&2; return 1; }
+  [[ "$hash_mr_h1" == "$hash_mr_h2" ]] || { echo "High cluster nodes differ in metrics_records contents" >&2; return 1; }
+
+  echo "  CHECK  All High/Low schema evolution invariants verified across High mesh"
+
+  stop_all_nodes
+  finish "$runtime" 0
+}
 
 case "$scenario" in
   encryption) encryption ;;
@@ -1595,6 +1876,8 @@ case "$scenario" in
   crash-recovery) crash_recovery ;;
   crdt-contention) crdt_contention ;;
   highlow-faults) highlow_faults ;;
-  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; highlow_faults ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|all}" >&2; exit 2 ;;
+  highlow-schema) highlow_schema ;;
+  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; highlow_faults; highlow_schema ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|highlow-schema|all}" >&2; exit 2 ;;
 esac
+
