@@ -67,11 +67,106 @@ async fn run(
         rtt_rx,
     } = opts;
 
+    let mut handles = vec![];
+
+    // Setup client http API immediately so /v1/health and /v1/admin/unlock are reachable
+    let mut http_handles = util::setup_http_api_handler(
+        &agent,
+        &mut tripwire,
+        subs_bcast_cache,
+        updates_bcast_cache,
+        &subs_manager,
+        api_listeners,
+    )
+    .await?;
+    handles.append(&mut http_handles);
+
+    let is_unlocked = agent.is_unlocked();
+    if is_unlocked {
+        spawn_background_services(
+            agent.clone(),
+            gossip_server_endpoint,
+            transport,
+            pconf,
+            tripwire,
+            rx_bcast,
+            rx_apply,
+            rx_clear_buf,
+            rx_changes,
+            rx_foca,
+            rx_plumtree,
+            rx_plumtree_updates,
+            rtt_rx,
+        )
+        .await?;
+    } else {
+        info!("Agent awaiting database unlock before starting background replication and mesh services...");
+        let agent_for_bg = agent.clone();
+        let tripwire_for_bg = tripwire.clone();
+
+        let bg_handle = spawn_counted(async move {
+            let mut tw = tripwire_for_bg.clone();
+            let unlock_notify = agent_for_bg.unlock_notify();
+            tokio::select! {
+                _ = unlock_notify.notified() => {
+                    info!("Agent received database unlock notification, starting background services!");
+                }
+                _ = &mut tw => {
+                    return;
+                }
+            }
+
+            if let Err(e) = spawn_background_services(
+                agent_for_bg,
+                gossip_server_endpoint,
+                transport,
+                pconf,
+                tripwire_for_bg,
+                rx_bcast,
+                rx_apply,
+                rx_clear_buf,
+                rx_changes,
+                rx_foca,
+                rx_plumtree,
+                rx_plumtree_updates,
+                rtt_rx,
+            )
+            .await
+            {
+                error!("Error running background services: {e}");
+            }
+        });
+        handles.push(bg_handle);
+    }
+
+    let bookie = agent.bookie().clone();
+    Ok((bookie, handles))
+}
+
+async fn spawn_background_services(
+    agent: Agent,
+    gossip_server_endpoint: quinn::Endpoint,
+    transport: Transport,
+    pconf: PerfConfig,
+    tripwire: Tripwire,
+    rx_bcast: corro_types::channel::CorroReceiver<corro_types::broadcast::BroadcastInput>,
+    rx_apply: corro_types::channel::CorroReceiver<corro_types::agent::ApplyTrigger>,
+    rx_clear_buf: corro_types::channel::CorroReceiver<(corro_types::actor::ActorId, corro_types::base::CrsqlDbVersionRange)>,
+    rx_changes: corro_types::channel::CorroReceiver<(corro_types::broadcast::ChangeV1, corro_types::broadcast::ChangeSource, Option<corro_types::broadcast::BroadcastV1>)>,
+    rx_foca: corro_types::channel::CorroReceiver<corro_types::broadcast::FocaInput>,
+    rx_plumtree: corro_types::channel::CorroReceiver<corro_types::broadcast::PlumtreeInput>,
+    rx_plumtree_updates: corro_types::channel::CorroReceiver<corro_types::broadcast::PlumtreeUpdates>,
+    rtt_rx: tokio::sync::mpsc::Receiver<(std::net::SocketAddr, std::time::Duration)>,
+) -> eyre::Result<()> {
     // Get our gossip address and make sure it's valid
     let gossip_addr = gossip_server_endpoint.local_addr()?;
 
+    // Load schema from paths before starting network and query listeners
+    if let Err(e) = execute_schema_from_paths(&agent).await {
+        error!("could not execute schema: {e}");
+    }
+
     //// Start PG server to accept query requests from PG clients
-    // TODO: pull this out into a separate function?
     if let Some(pg_confs) = agent.config().api.pg.clone() {
         info!("Starting PostgreSQL wire-compatible server");
         for pg_conf in pg_confs {
@@ -95,7 +190,6 @@ async fn run(
 
     //// Start the main SWIM runtime loop
     let foca_config = runtime_loop(
-        // here the agent already has the current cluster_id, we don't need to pass one
         agent.actor(None, agent.config().gossip.member_id),
         agent.clone(),
         rx_foca,
@@ -136,24 +230,6 @@ async fn run(
         ),
     };
 
-    // Load schema from paths
-    if let Err(e) = execute_schema_from_paths(&agent).await {
-        error!("could not execute schema: {e}");
-    }
-
-    let mut handles = vec![];
-    // Setup client http API
-    let mut http_handles = util::setup_http_api_handler(
-        &agent,
-        &mut tripwire,
-        subs_bcast_cache,
-        updates_bcast_cache,
-        &subs_manager,
-        api_listeners,
-    )
-    .await?;
-    handles.append(&mut http_handles);
-
     spawn_counted(util::clear_buffered_meta_loop(
         agent.clone(),
         rx_clear_buf,
@@ -183,7 +259,7 @@ async fn run(
 
     let bookie = agent.bookie().clone();
 
-    // Bookie was fully loaded by setup(). Walk it to schedule apply for any
+    // Bookie was fully loaded during init_database_state. Walk it to schedule apply for any
     // fully-buffered (gap-free) partials that were never applied before shutdown.
     let start = Instant::now();
     {
@@ -236,8 +312,6 @@ async fn run(
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
-    //// Start an incoming (corrosion) connection handler.  This
-    //// future tree spawns additional message type sub-handlers
     handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
     if agent.config().highlow.enabled {
@@ -249,11 +323,10 @@ async fn run(
         }
     }
 
-    let changes_handle = spawn_counted(
+    spawn_counted(
         handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())
             .inspect(|_| info!("corrosion handle changes loop is done")),
     );
-    handles.push(changes_handle);
 
-    Ok((bookie, handles))
+    Ok(())
 }

@@ -35,6 +35,16 @@ pub async fn api_v1_updates(
     Extension(tripwire): Extension<Tripwire>,
     axum::extract::Path(table): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if !agent.is_unlocked() {
+        return hyper::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&corro_types::api::QueryEvent::Error("database is locked / awaiting unlock".into()))
+                    .expect("could not serialize error json"),
+            ))
+            .expect("could not build response");
+    }
+
     info!("Received update request for table: {table}");
 
     assert_sometimes!(true, "Corrosion receives requests for table updates");
@@ -45,7 +55,7 @@ pub async fn api_v1_updates(
     let upsert_res = updates.get_or_insert(
         &table,
         &agent.schema().read(),
-        agent.pool(),
+        &agent.pool(),
         tripwire.clone(),
     );
 

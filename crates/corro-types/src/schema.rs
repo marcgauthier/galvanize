@@ -104,9 +104,23 @@ pub struct Index {
     pub unique: bool,
 }
 
+/// A managed SQLite view. Views are local SQLite schema objects: unlike tables,
+/// they are never registered with CR-SQLite or replicated independently.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct View {
+    pub name: String,
+    /// Normalized `CREATE VIEW` SQL, always without `IF NOT EXISTS` so a
+    /// conflicting unmanaged object cannot be silently retained.
+    pub sql: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
     pub tables: IndexMap<String, Table>,
+    pub views: IndexMap<String, View>,
+    /// Explicit view removals requested by `DROP VIEW IF EXISTS` statements.
+    /// This is only populated while parsing a schema update, never persisted.
+    pub dropped_views: IndexSet<String>,
 }
 
 impl Schema {
@@ -186,10 +200,16 @@ pub enum SchemaError {
     DropIndexWithCreate { name: String },
     #[error("DROP INDEX without IF EXISTS is not supported; use 'DROP INDEX IF EXISTS {name}'")]
     DropIndexWithoutIfExists { name: String },
+    #[error("DROP VIEW conflicts with a CREATE VIEW in the same schema for '{name}' (would cause create/destroy loop)")]
+    DropViewWithCreate { name: String },
+    #[error("DROP VIEW without IF EXISTS is not supported; use 'DROP VIEW IF EXISTS {name}'")]
+    DropViewWithoutIfExists { name: String },
     #[error("missing table for index (table: '{tbl_name}', index: '{name}')")]
     IndexWithoutTable { tbl_name: String, name: String },
     #[error("temporary tables are not supported: {0}")]
     TemporaryTable(Cmd),
+    #[error("temporary views are not supported: {0}")]
+    TemporaryView(Cmd),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -210,31 +230,22 @@ pub fn init_schema(conn: &Connection) -> Result<Schema, Box<SchemaError>> {
     fn dump(conn: &Connection) -> Result<String, rusqlite::Error> {
         let mut dump = String::new();
 
-        let tables: HashMap<String, String> = conn
-            .prepare(
-                r#"SELECT name, sql FROM __corro_schema WHERE type = "table" ORDER BY tbl_name"#,
-            )?
-            .query_map((), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
+        let mut statements = conn.prepare(
+            r#"SELECT sql
+               FROM __corro_schema
+               WHERE type IN ('table', 'index', 'view')
+               ORDER BY CASE type
+                   WHEN 'table' THEN 1
+                   WHEN 'index' THEN 2
+                   WHEN 'view' THEN 3
+               END, tbl_name, name"#,
+        )?;
+        let sql: Vec<String> = statements
+            .query_map((), |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
 
-        for sql in tables.values() {
-            dump.push_str(sql.as_str());
-            dump.push(';');
-        }
-
-        let indexes: HashMap<String, String> = conn
-            .prepare(
-                r#"SELECT name, sql FROM __corro_schema WHERE type = "index" ORDER BY tbl_name"#,
-            )?
-            .query_map((), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-
-        for sql in indexes.values() {
-            dump.push_str(sql.as_str());
+        for sql in sql {
+            dump.push_str(&sql);
             dump.push(';');
         }
 
@@ -672,6 +683,33 @@ pub fn apply_schema(
         }
     }
 
+    // Views must be handled after all table and index work. They are ordinary
+    // SQLite objects and must never be passed to crsql_as_crr.
+    for name in schema
+        .views
+        .keys()
+        .filter(|name| !new_schema.views.contains_key(*name))
+    {
+        info!("dropping view '{name}'");
+        tx.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_identifier(name)))?;
+    }
+
+    for (name, view) in &new_schema.views {
+        let changed = schema
+            .views
+            .get(name)
+            .is_some_and(|current| current != view);
+        if changed {
+            info!("replacing view '{name}' (drop + create)");
+            tx.execute_batch(&format!("DROP VIEW IF EXISTS {}", quote_identifier(name)))?;
+        }
+
+        if changed || !schema.views.contains_key(name) {
+            info!("creating view '{name}'");
+            tx.execute_batch(&view.sql)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -679,6 +717,7 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<Sch
     trace!("parsing {sql}");
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
     let mut dropped_indexes: Vec<String> = Vec::new();
+    let mut dropped_views: Vec<String> = Vec::new();
 
     loop {
         match parser.next() {
@@ -740,6 +779,37 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<Sch
                         }));
                     }
                 }
+                Stmt::CreateView {
+                    temporary: true, ..
+                } => return Err(Box::new(SchemaError::TemporaryView(cmd.clone()))),
+                Stmt::CreateView {
+                    temporary: false,
+                    view_name,
+                    columns,
+                    select,
+                    ..
+                } => {
+                    let name = unquote(view_name.name.0.as_str())
+                        .unwrap_or_else(|_| view_name.name.0.clone());
+                    // Do not retain IF NOT EXISTS: view reconciliation decides
+                    // whether creation is valid, rather than silently keeping a
+                    // stale local view with the same name.
+                    let create_sql = Cmd::Stmt(Stmt::CreateView {
+                        temporary: false,
+                        if_not_exists: false,
+                        view_name: view_name.clone(),
+                        columns: columns.clone(),
+                        select: select.clone(),
+                    })
+                    .to_string();
+                    schema.views.insert(
+                        name.clone(),
+                        View {
+                            name,
+                            sql: create_sql,
+                        },
+                    );
+                }
                 Stmt::DropIndex {
                     if_exists: false,
                     idx_name,
@@ -757,6 +827,22 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<Sch
                     let idx_name = unquote(idx_name.name.0.as_str())
                         .unwrap_or_else(|_| idx_name.name.0.clone());
                     dropped_indexes.push(idx_name);
+                }
+                Stmt::DropView {
+                    if_exists: false,
+                    view_name,
+                } => {
+                    let name = unquote(view_name.name.0.as_str())
+                        .unwrap_or_else(|_| view_name.name.0.clone());
+                    return Err(Box::new(SchemaError::DropViewWithoutIfExists { name }));
+                }
+                Stmt::DropView {
+                    if_exists: true,
+                    view_name,
+                } => {
+                    let name = unquote(view_name.name.0.as_str())
+                        .unwrap_or_else(|_| view_name.name.0.clone());
+                    dropped_views.push(name);
                 }
                 _ => return Err(Box::new(SchemaError::UnsupportedCmd(cmd.clone()))),
             },
@@ -777,7 +863,20 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<Sch
         }
     }
 
+    for view_name in &dropped_views {
+        if schema.views.contains_key(view_name) {
+            return Err(Box::new(SchemaError::DropViewWithCreate {
+                name: view_name.clone(),
+            }));
+        }
+        schema.dropped_views.insert(view_name.clone());
+    }
+
     Ok(())
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 pub fn parse_sql(sql: &str) -> Result<Schema, Box<SchemaError>> {
@@ -997,5 +1096,68 @@ CREATE TABLE IF NOT EXISTS test_tbl (
             }
             other => panic!("expected DropIndexWithoutIfExists, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_create_view() {
+        let sql = format!(
+            "{BASE_TABLE_SQL}\nCREATE VIEW active_test_tbl AS SELECT id, name FROM test_tbl WHERE name != '';"
+        );
+        let schema = parse_sql(&sql).expect("should parse view");
+        let view = schema.views.get("active_test_tbl").expect("view exists");
+        assert_eq!(view.name, "active_test_tbl");
+        assert!(view
+            .sql
+            .starts_with("CREATE VIEW active_test_tbl AS SELECT"));
+        assert!(!view.sql.contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_create_view_if_not_exists_is_normalized() {
+        let sql = format!(
+            "{BASE_TABLE_SQL}\nCREATE VIEW IF NOT EXISTS active_test_tbl AS SELECT id FROM test_tbl;"
+        );
+        let schema = parse_sql(&sql).expect("should parse view");
+        assert!(!schema.views["active_test_tbl"]
+            .sql
+            .contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_temporary_views_rejected() {
+        for temporary in ["TEMP", "TEMPORARY"] {
+            let sql = format!(
+                "{BASE_TABLE_SQL}\nCREATE {temporary} VIEW active_test_tbl AS SELECT id FROM test_tbl;"
+            );
+            let err = parse_sql(&sql).expect_err("should reject temporary view");
+            assert!(matches!(err.as_ref(), SchemaError::TemporaryView(_)));
+        }
+    }
+
+    #[test]
+    fn test_drop_view_if_exists() {
+        let schema = parse_sql("DROP VIEW IF EXISTS old_view;").expect("should parse drop view");
+        assert!(schema.dropped_views.contains("old_view"));
+    }
+
+    #[test]
+    fn test_drop_view_without_if_exists_rejected() {
+        let err = parse_sql("DROP VIEW old_view;").expect_err("should reject unsafe drop view");
+        assert!(matches!(
+            err.as_ref(),
+            SchemaError::DropViewWithoutIfExists { name } if name == "old_view"
+        ));
+    }
+
+    #[test]
+    fn test_drop_view_with_create_rejected() {
+        let sql = format!(
+            "{BASE_TABLE_SQL}\nCREATE VIEW active_test_tbl AS SELECT id FROM test_tbl;\nDROP VIEW IF EXISTS active_test_tbl;"
+        );
+        let err = parse_sql(&sql).expect_err("should reject create/drop loop");
+        assert!(matches!(
+            err.as_ref(),
+            SchemaError::DropViewWithCreate { name } if name == "active_test_tbl"
+        ));
     }
 }

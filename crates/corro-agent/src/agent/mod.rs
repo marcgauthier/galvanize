@@ -12,7 +12,7 @@ pub mod highlow;
 mod metrics;
 mod reaper;
 mod run_root;
-mod setup;
+pub mod setup;
 mod uni;
 pub mod util;
 

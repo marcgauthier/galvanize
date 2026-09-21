@@ -8,7 +8,7 @@
 use crate::{
     agent::{handlers, CountedExecutor, TO_CLEAR_COUNT},
     api::public::{
-        api_v1_health, api_v1_queries, api_v1_table_stats, api_v1_transactions,
+        api_v1_health, api_v1_queries, api_v1_table_stats, api_v1_transactions, api_v1_unlock,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
         update::SharedUpdateBroadcastCache,
     },
@@ -294,6 +294,34 @@ pub async fn setup_http_api_handler(
         .route(
             "/v1/health",
             get(api_v1_health).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(4)),
+            ),
+        )
+        .route(
+            "/v1/admin/unlock",
+            post(api_v1_unlock).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(4)),
+            ),
+        )
+        .route(
+            "/v1/unlock",
+            post(api_v1_unlock).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -1722,13 +1750,23 @@ pub async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Res
     // hold onto this lock so nothing else makes changes
     let mut schema_write = agent.schema().write();
 
-    let schema_changed = partial_schema.tables.iter().any(|(name, table)| {
+    let tables_changed = partial_schema.tables.iter().any(|(name, table)| {
         schema_write.tables.get(name).is_none_or(|current| {
             current.pk != table.pk
                 || current.columns != table.columns
                 || current.indexes != table.indexes
         })
     });
+    let views_changed = partial_schema.views.iter().any(|(name, view)| {
+        schema_write
+            .views
+            .get(name)
+            .is_none_or(|current| current != view)
+    }) || partial_schema
+        .dropped_views
+        .iter()
+        .any(|name| schema_write.views.contains_key(name));
+    let schema_changed = tables_changed || views_changed;
 
     // clone the previous schema and apply
     let mut new_schema = {
@@ -1736,6 +1774,12 @@ pub async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Res
         for (name, def) in partial_schema.tables.iter() {
             // overwrite table because users are expected to return a full table def
             schema.tables.insert(name.clone(), def.clone());
+        }
+        for (name, def) in partial_schema.views.iter() {
+            schema.views.insert(name.clone(), def.clone());
+        }
+        for name in &partial_schema.dropped_views {
+            schema.views.shift_remove(name);
         }
         schema
     };
@@ -1754,6 +1798,25 @@ pub async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Res
 
             let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL", [tbl_name])?;
             info!("Updated {n} rows in __corro_schema for table {tbl_name}");
+        }
+
+        for view_name in partial_schema.views.keys() {
+            tx.execute(
+                "DELETE FROM __corro_schema WHERE type = 'view' AND name = ?",
+                [view_name],
+            )?;
+            let n = tx.execute(
+                "INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE type = 'view' AND name = ? AND sql IS NOT NULL",
+                [view_name],
+            )?;
+            info!("Updated {n} rows in __corro_schema for view {view_name}");
+        }
+
+        for view_name in &partial_schema.dropped_views {
+            tx.execute(
+                "DELETE FROM __corro_schema WHERE type = 'view' AND name = ?",
+                [view_name],
+            )?;
         }
 
         tx.commit()?;

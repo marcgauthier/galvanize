@@ -74,16 +74,27 @@ pub struct AgentOptions {
     pub tripwire: Tripwire,
 }
 
-/// Setup an agent runtime and state with a configuration
-pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
-    debug!("setting up corrosion @ {}", conf.db.path);
+pub struct UnlockedDbState {
+    pub actor_id: ActorId,
+    pub pool: SplitPool,
+    pub clock: Arc<uhlc::HLC>,
+    pub schema: Schema,
+    pub bookie: Bookie,
+    pub booked: corro_types::agent::Booked,
+    pub cluster_id: corro_types::actor::ClusterId,
+    pub subs_manager: SubsManager,
+    pub subs_bcast_cache: SharedMatcherBroadcastCache,
+}
 
+/// Initialize database state (SQLite connection, pool, migrations, schemas, bookie, subscriptions)
+pub async fn init_database_state(
+    conf: &Config,
+    write_sema: Arc<Semaphore>,
+    tripwire: &Tripwire,
+) -> eyre::Result<UnlockedDbState> {
     if let Some(parent) = conf.db.path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-
-    // do this early to error earlier
-    let members = Members::new(conf.gossip.member_id);
 
     let actor_id = {
         // we need to set auto_vacuum before any tables are created
@@ -105,15 +116,14 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     info!("Actor ID: {actor_id}");
 
-    let write_sema = Arc::new(Semaphore::new(1));
-
     let pool = SplitPool::create(
         &conf.db.path,
         write_sema.clone(),
         conf.db.cache_size_kib,
         conf.db.mmap_size_bytes,
         conf.db.journal_size_limit_bytes,
-    ).await?;
+    )
+    .await?;
 
     let clock = Arc::new(
         uhlc::HLCBuilder::default()
@@ -133,18 +143,14 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let subs_manager = SubsManager::default();
 
-    let updates_manager = UpdatesManager::default();
-    // Setup subscription handlers, this is before we start processing changes.
     let subs_bcast_cache = setup_spawn_subscriptions(
         &subs_manager,
         conf.db.subscriptions_path(),
         &pool,
         &schema,
-        &tripwire,
+        tripwire,
     )
     .await?;
-
-    let updates_bcast_cache = SharedUpdateBroadcastCache::default();
 
     let cluster_id = {
         let conn = pool.read().await?;
@@ -158,6 +164,103 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     };
 
     info!("Cluster ID: {cluster_id}");
+
+    // Load all actors' bookie state synchronously.
+    let start = Instant::now();
+    let all_booked = {
+        let conn = pool.read().await?;
+        BookedVersions::load_all_from_conn(&conn)?
+    };
+    info!("Loaded booked versions in {:?}", start.elapsed());
+
+    let bookie = Bookie::new(all_booked);
+    let booked = bookie.ensure(actor_id);
+
+    Ok(UnlockedDbState {
+        actor_id,
+        pool,
+        clock,
+        schema,
+        bookie,
+        booked,
+        cluster_id,
+        subs_manager,
+        subs_bcast_cache,
+    })
+}
+
+/// Setup an agent runtime and state with a configuration
+pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
+    debug!("setting up corrosion @ {}", conf.db.path);
+
+    if let Some(parent) = conf.db.path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    // do this early to error earlier
+    let members = Members::new(conf.gossip.member_id);
+    let write_sema = Arc::new(Semaphore::new(1));
+
+    let maybe_unlocked = if conf.db.await_unlock && !galv_rekey_cli::is_unlocked() {
+        info!("Database configured with await_unlock = true. Booting in AwaitingUnlock state.");
+        None
+    } else if galv_rekey_cli::is_unlocked() {
+        Some(init_database_state(&conf, write_sema.clone(), &tripwire).await?)
+    } else {
+        match init_database_state(&conf, write_sema.clone(), &tripwire).await {
+            Ok(state) => Some(state),
+            Err(e) => {
+                info!("Database locked or requires unlock: {e}. Booting in AwaitingUnlock state.");
+                None
+            }
+        }
+    };
+
+    let lock_state = if maybe_unlocked.is_some() {
+        corro_types::agent::AgentLockState::Unlocked
+    } else {
+        corro_types::agent::AgentLockState::AwaitingUnlock
+    };
+
+    let (actor_id, pool, clock, schema, bookie, booked, cluster_id, subs_manager, subs_bcast_cache) =
+        match maybe_unlocked {
+            Some(state) => (
+                state.actor_id,
+                state.pool,
+                state.clock,
+                state.schema,
+                state.bookie,
+                state.booked,
+                state.cluster_id,
+                state.subs_manager,
+                state.subs_bcast_cache,
+            ),
+            None => {
+                let default_actor_id = ActorId::default();
+                let clock = Arc::new(
+                    uhlc::HLCBuilder::default()
+                        .with_id(default_actor_id.try_into().unwrap_or_else(|_| uhlc::ID::rand()))
+                        .with_max_delta(Duration::from_millis(300))
+                        .build(),
+                );
+                let bookie = Bookie::new(Default::default());
+                let booked = bookie.ensure(default_actor_id);
+                (
+                    default_actor_id,
+                    SplitPool::dummy(),
+                    clock,
+                    Schema::default(),
+                    bookie,
+                    booked,
+                    Default::default(),
+                    SubsManager::default(),
+                    Arc::new(TokioRwLock::new(MatcherBroadcastCache::default())),
+                )
+            }
+        };
+
+    let updates_manager = UpdatesManager::default();
+    let updates_bcast_cache = SharedUpdateBroadcastCache::default();
 
     let (tx_apply, rx_apply) = bounded(conf.perf.apply_channel_len, "apply");
     let (tx_clear_buf, rx_clear_buf) = bounded(conf.perf.clearbuf_channel_len, "clear_buf");
@@ -185,19 +288,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_plumtree_updates, rx_plumtree_updates) =
         bounded(conf.perf.foca_channel_len, "plumtree_updates");
 
-    // Load all actors' bookie state synchronously.
-    let start = Instant::now();
-    let all_booked = {
-        let conn = pool.read().await?;
-        BookedVersions::load_all_from_conn(&conn)?
-    };
-    info!("Loaded booked versions in {:?}", start.elapsed());
-
-    let bookie = Bookie::new(all_booked);
-    let booked = bookie.ensure(actor_id);
-
     let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
-
     let change_dict = load_change_dicts(&conf.gossip.compression_config())?;
 
     let opts = AgentOptions {
@@ -246,6 +337,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         tripwire,
         fatal_issue: Default::default(),
         shutdown_token: CancellationToken::new(),
+        lock_state,
     });
 
     Ok((agent, opts))

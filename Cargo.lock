@@ -1085,6 +1085,7 @@ dependencies = [
  "strum",
  "thiserror 1.0.69",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2111,6 +2112,7 @@ name = "galv-rekey-cli"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "parking_lot",
  "rpassword",
  "rusqlite",
  "serde",

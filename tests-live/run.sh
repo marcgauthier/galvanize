@@ -52,9 +52,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+unlock_node() {
+  local api_port=$1 key=$2
+  local deadline=$((SECONDS + timeout_seconds))
+  until curl -fsS -X POST "http://127.0.0.1:$api_port/v1/admin/unlock" \
+    -H "Content-Type: application/json" \
+    -d "{\"key\": \"$key\", \"cipher\": \"chacha20\"}" >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || { echo "Failed to unlock node on port $api_port" >&2; return 1; }
+    sleep 0.1
+  done
+}
+
 write_node() {
   local node=$1 gossip=$2 pg=$3 bootstrap=$4 key=$5 allow=$6
   local label=${node##*/node-}
+  local pg_port=${pg##*:}
+  local api_port=$(( pg_port - 11000 ))
+  local await_unlock="false"
+  [[ -n "$key" ]] && await_unlock="true"
   mkdir -p "$node/schema" "$node/logs"
   echo "  START  node ${label^^}  pg=$pg gossip=$gossip allow=$allow"
   cat >"$node/schema/live.sql" <<'SQL'
@@ -68,8 +83,9 @@ SQL
 [db]
 path = "$node/corrosion.db"
 schema_paths = ["$node/schema"]
+await-unlock = $await_unlock
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:$api_port"
 [[api.pg]]
 addr = "$pg"
 [gossip]
@@ -83,15 +99,21 @@ path = "$node/admin.sock"
 [log]
 format = "json"
 EOF
-  GALVANIZE_DB_KEY="$key" \
-    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
     "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
+  if [[ -n "$key" ]]; then
+    unlock_node "$api_port" "$key"
+  fi
 }
 
 start_node_instance() {
   local node=$1 gossip=$2 pg=$3 bootstrap=$4 key=$5 allow=$6
   local label=${node##*/node-}
+  local pg_port=${pg##*:}
+  local api_port=$(( pg_port - 11000 ))
+  local await_unlock="false"
+  [[ -n "$key" ]] && await_unlock="true"
   mkdir -p "$node/schema" "$node/logs"
   echo "  START  node ${label^^}  pg=$pg gossip=$gossip allow=$allow"
   cat >"$node/schema/live.sql" <<'SQL'
@@ -105,8 +127,9 @@ SQL
 [db]
 path = "$node/corrosion.db"
 schema_paths = ["$node/schema"]
+await-unlock = $await_unlock
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:$api_port"
 [[api.pg]]
 addr = "$pg"
 [gossip]
@@ -120,15 +143,21 @@ path = "$node/admin.sock"
 [log]
 format = "json"
 EOF
-  GALVANIZE_DB_KEY="$key" \
-    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
     "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
+  if [[ -n "$key" ]]; then
+    unlock_node "$api_port" "$key"
+  fi
 }
 
 start_named_node() {
   local name=$1 node=$2 gossip=$3 pg=$4 bootstrap=$5 key=$6 allow=$7
   local label=${node##*/node-}
+  local pg_port=${pg##*:}
+  local api_port=$(( pg_port - 11000 ))
+  local await_unlock="false"
+  [[ -n "$key" ]] && await_unlock="true"
   mkdir -p "$node/schema" "$node/logs"
   echo "  START  node ${label^^}  pg=$pg gossip=$gossip allow=$allow"
   cat >"$node/schema/live.sql" <<'SQL'
@@ -142,8 +171,9 @@ SQL
 [db]
 path = "$node/corrosion.db"
 schema_paths = ["$node/schema"]
+await-unlock = $await_unlock
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:$api_port"
 [[api.pg]]
 addr = "$pg"
 [gossip]
@@ -160,12 +190,14 @@ max_sync_backoff = 2
 [log]
 format = "json"
 EOF
-  GALVANIZE_DB_KEY="$key" \
-    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
     "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
   local pid=$!
   cleanup_pids+=("$pid")
   named_pids["$name"]="$pid"
+  if [[ -n "$key" ]]; then
+    unlock_node "$api_port" "$key"
+  fi
 }
 
 kill_named_node_hard() {
@@ -199,6 +231,10 @@ wait_node() {
 start_contention_node() {
   local name=$1 node=$2 gossip=$3 pg=$4 bootstrap=$5 key=$6 allow=$7
   local label=${node##*/node-}
+  local pg_port=${pg##*:}
+  local api_port=$(( pg_port - 11000 ))
+  local await_unlock="false"
+  [[ -n "$key" ]] && await_unlock="true"
   mkdir -p "$node/schema" "$node/logs"
   echo "  START  node ${label^^}  pg=$pg gossip=$gossip allow=$allow"
   cat >"$node/schema/contention.sql" <<'SQL'
@@ -215,8 +251,9 @@ SQL
 [db]
 path = "$node/corrosion.db"
 schema_paths = ["$node/schema"]
+await-unlock = $await_unlock
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:$api_port"
 [[api.pg]]
 addr = "$pg"
 [gossip]
@@ -233,12 +270,14 @@ max_sync_backoff = 2
 [log]
 format = "json"
 EOF
-  GALVANIZE_DB_KEY="$key" \
-    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
     "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
   local pid=$!
   cleanup_pids+=("$pid")
   named_pids["$name"]="$pid"
+  if [[ -n "$key" ]]; then
+    unlock_node "$api_port" "$key"
+  fi
 }
 
 wait_contention_node() {
@@ -268,6 +307,10 @@ wait_benchmark_node() {
 start_benchmark_node() {
   local node=$1 gossip=$2 pg=$3 metrics=$4 bootstrap=$5 key=$6
   local label=${node##*/node-}
+  local pg_port=${pg##*:}
+  local api_port=$(( pg_port - 11000 ))
+  local await_unlock="false"
+  [[ -n "$key" ]] && await_unlock="true"
   mkdir -p "$node/schema" "$node/logs"
   echo "  START  node ${label^^}  pg=$pg gossip=$gossip metrics=$metrics"
   cat >"$node/schema/benchmark.sql" <<'SQL'
@@ -281,8 +324,9 @@ SQL
 [db]
 path = "$node/corrosion.db"
 schema_paths = ["$node/schema"]
+await-unlock = $await_unlock
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:$api_port"
 [[api.pg]]
 addr = "$pg"
 [gossip]
@@ -301,16 +345,128 @@ bind_addr = "$metrics"
 [log]
 format = "json"
 EOF
-  GALVANIZE_DB_KEY="$key" \
-    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
     "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
+  if [[ -n "$key" ]]; then
+    unlock_node "$api_port" "$key"
+  fi
 }
 
 benchmark_tx_bytes() {
   local metrics_port=$1
   curl -fsS "http://127.0.0.1:$metrics_port/metrics" |
     awk '$1 ~ /^corro_transport_tx_bytes_v2_total(\{|$)/ { total += $2 } END { printf "%.0f\n", total + 0 }'
+}
+
+start_views_node() {
+  local node=$1 gossip=$2 pg=$3 bootstrap=$4 key=$5
+  local label=${node##*/node-}
+  local pg_port=${pg##*:}
+  local api_port=$(( pg_port - 11000 ))
+  local await_unlock="false"
+  [[ -n "$key" ]] && await_unlock="true"
+  mkdir -p "$node/schema" "$node/logs"
+  echo "  START  node ${label^^}  pg=$pg gossip=$gossip"
+  cat >"$node/schema/views.sql" <<'SQL'
+CREATE TABLE IF NOT EXISTS view_devices (
+  id INTEGER PRIMARY KEY NOT NULL,
+  hostname TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1
+) WITHOUT ROWID;
+
+CREATE VIEW enabled_devices AS
+SELECT id, hostname
+FROM view_devices
+WHERE enabled = 1;
+SQL
+  cat >"$node/config.toml" <<EOF
+[db]
+path = "$node/corrosion.db"
+schema_paths = ["$node/schema"]
+await-unlock = $await_unlock
+[api]
+addr = "127.0.0.1:$api_port"
+[[api.pg]]
+addr = "$pg"
+[gossip]
+addr = "$gossip"
+client_addr_v4 = "${gossip%:*}:0"
+bootstrap = $bootstrap
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+EOF
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::handlers=debug}" \
+    "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+  if [[ -n "$key" ]]; then
+    unlock_node "$api_port" "$key"
+  fi
+}
+
+wait_views_node() {
+  local port=$1 deadline=$((SECONDS + timeout_seconds))
+  wait_pg "$port"
+  until psql "postgresql://postgres@127.0.0.1:$port/postgres" -Atqc 'SELECT count(*) FROM enabled_devices' >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || { echo "managed view was not ready on $port" >&2; return 1; }
+    sleep 0.2
+  done
+  echo "  READY  pg=127.0.0.1:$port schema=view_devices,enabled_devices"
+}
+
+views() {
+  local runtime="$runtime_root/views"
+  local pg_a=55011 pg_b=55012 pg_c=55013
+  local expected_view=$'1:router-a\n3:router-c'
+  local deadline count_a count_b count_c view_a view_b view_c hash_a hash_b hash_c
+  rm -rf "$runtime"; mkdir -p "$runtime"; active_runtime=$runtime
+  echo "== views: three-node managed SQLite view replication =="
+
+  start_views_node "$runtime/node-a" 127.0.0.111:48111 "127.0.0.1:$pg_a" '["127.0.0.112:48112", "127.0.0.113:48113"]' 'galv-live-views-key-a'
+  start_views_node "$runtime/node-b" 127.0.0.112:48112 "127.0.0.1:$pg_b" '["127.0.0.111:48111", "127.0.0.113:48113"]' 'galv-live-views-key-b'
+  start_views_node "$runtime/node-c" 127.0.0.113:48113 "127.0.0.1:$pg_c" '["127.0.0.111:48111", "127.0.0.112:48112"]' 'galv-live-views-key-c'
+  wait_views_node "$pg_a"; wait_views_node "$pg_b"; wait_views_node "$pg_c"
+
+  psql "postgresql://postgres@127.0.0.1:$pg_a/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO view_devices (id, hostname, enabled) VALUES (1, 'router-a', 1);" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:$pg_b/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO view_devices (id, hostname, enabled) VALUES (2, 'router-b', 0);" >/dev/null
+  psql "postgresql://postgres@127.0.0.1:$pg_c/postgres" -v ON_ERROR_STOP=1 -qc "INSERT INTO view_devices (id, hostname, enabled) VALUES (3, 'router-c', 1);" >/dev/null
+  echo "  WRITE  committed one device through each PostgreSQL listener"
+
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    count_a=$(psql "postgresql://postgres@127.0.0.1:$pg_a/postgres" -Atqc 'SELECT count(*) FROM view_devices')
+    count_b=$(psql "postgresql://postgres@127.0.0.1:$pg_b/postgres" -Atqc 'SELECT count(*) FROM view_devices')
+    count_c=$(psql "postgresql://postgres@127.0.0.1:$pg_c/postgres" -Atqc 'SELECT count(*) FROM view_devices')
+    view_a=$(psql "postgresql://postgres@127.0.0.1:$pg_a/postgres" -Atqc "SELECT id || ':' || hostname FROM enabled_devices ORDER BY id")
+    view_b=$(psql "postgresql://postgres@127.0.0.1:$pg_b/postgres" -Atqc "SELECT id || ':' || hostname FROM enabled_devices ORDER BY id")
+    view_c=$(psql "postgresql://postgres@127.0.0.1:$pg_c/postgres" -Atqc "SELECT id || ':' || hostname FROM enabled_devices ORDER BY id")
+    [[ $count_a == 3 && $count_b == 3 && $count_c == 3 && $view_a == "$expected_view" && $view_b == "$expected_view" && $view_c == "$expected_view" ]] && break
+    sleep 0.2
+  done
+  [[ $count_a == 3 && $count_b == 3 && $count_c == 3 ]] || { echo 'underlying table did not converge to three rows' >&2; return 1; }
+  [[ $view_a == "$expected_view" && $view_b == "$expected_view" && $view_c == "$expected_view" ]] || { echo 'view results did not converge on all nodes' >&2; return 1; }
+
+  hash_a=$(psql "postgresql://postgres@127.0.0.1:$pg_a/postgres" -Atqc "SELECT id || ':' || hostname || ':' || enabled FROM view_devices ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_b=$(psql "postgresql://postgres@127.0.0.1:$pg_b/postgres" -Atqc "SELECT id || ':' || hostname || ':' || enabled FROM view_devices ORDER BY id" | sha256sum | awk '{print $1}')
+  hash_c=$(psql "postgresql://postgres@127.0.0.1:$pg_c/postgres" -Atqc "SELECT id || ':' || hostname || ':' || enabled FROM view_devices ORDER BY id" | sha256sum | awk '{print $1}')
+  [[ $hash_a == "$hash_b" && $hash_b == "$hash_c" ]] || { echo 'replicated table snapshots differ' >&2; return 1; }
+  echo "  CHECK  all nodes have identical replicated-table SHA-256=$hash_a"
+
+  local port view_type view_changes
+  for port in "$pg_a" "$pg_b" "$pg_c"; do
+    view_type=$(psql "postgresql://postgres@127.0.0.1:$port/postgres" -Atqc "SELECT type FROM sqlite_schema WHERE name = 'enabled_devices'")
+    view_changes=$(psql "postgresql://postgres@127.0.0.1:$port/postgres" -Atqc "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'enabled_devices'")
+    [[ $view_type == view && $view_changes == 0 ]] || { echo "view replication boundary failed on PostgreSQL port $port" >&2; return 1; }
+  done
+  echo "  CHECK  enabled_devices is a local view and never appears in crsql_changes"
+  finish "$runtime" 0
 }
 
 stop_last_node() {
@@ -390,8 +546,9 @@ encryption() {
   grep -a -q 'from-b-' "$runtime/node-b/corrosion.db" || grep -a -q 'from-b-' "$runtime/node-b/corrosion.db-wal"
   echo "  CHECK  direct encrypted-node database/WAL inspection found no application plaintext"
   echo "  CHECK  unencrypted node B retains application plaintext on disk"
-  GALVANIZE_DB_KEY=wrong "$binary" --config "$runtime/node-a/config.toml" agent >"$runtime/node-a/logs/wrong-key.log" 2>&1 &
+  "$binary" --config "$runtime/node-a/config.toml" agent >"$runtime/node-a/logs/wrong-key.log" 2>&1 &
   local wrong_pid=$!; sleep 1
+  ! curl -fsS -X POST "http://127.0.0.1:43911/v1/admin/unlock" -H "Content-Type: application/json" -d '{"key": "wrong", "cipher": "chacha20"}' >/dev/null 2>&1
   ! psql "postgresql://postgres@127.0.0.1:54911/postgres" -Atqc 'SELECT 1' >/dev/null 2>&1
   echo "  CHECK  wrong key cannot serve PostgreSQL"
   kill "$wrong_pid" 2>/dev/null || true; wait "$wrong_pid" 2>/dev/null || true
@@ -1322,8 +1479,9 @@ print(priv.public_key().public_bytes_raw().hex())
 [db]
 path = "$node_low_1/corrosion.db"
 schema_paths = ["$node_low_1/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43981"
 [[api.pg]]
 addr = "127.0.0.1:54981"
 [gossip]
@@ -1361,8 +1519,9 @@ EOF
 [db]
 path = "$node_high_1/corrosion.db"
 schema_paths = ["$node_high_1/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43982"
 [[api.pg]]
 addr = "127.0.0.1:54982"
 [gossip]
@@ -1399,8 +1558,9 @@ EOF
 [db]
 path = "$node_high_2/corrosion.db"
 schema_paths = ["$node_high_2/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43983"
 [[api.pg]]
 addr = "127.0.0.1:54983"
 [gossip]
@@ -1419,25 +1579,25 @@ format = "json"
 EOF
 
   echo "  START  Starting Low exporter and High receiver cluster"
-  GALVANIZE_DB_KEY="galv-fault-low-1" \
-    GALV_TEST_RSA_PUB="$rsa_pub_content" \
+  GALV_TEST_RSA_PUB="$rsa_pub_content" \
     GALV_TEST_ED25519_KEY="$low_priv_hex" \
     RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_low_1/config.toml" agent >"$node_low_1/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
-  GALVANIZE_DB_KEY="galv-fault-high-1" \
-    GALV_TEST_RSA_PRIV="$rsa_priv_content" \
+  GALV_TEST_RSA_PRIV="$rsa_priv_content" \
     GALV_TEST_PERMITTED_SENDER="$low_pub_hex" \
     RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_high_1/config.toml" agent >"$node_high_1/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
-  GALVANIZE_DB_KEY="galv-fault-high-2" \
-    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_high_2/config.toml" agent >"$node_high_2/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
+  unlock_node 43981 'galv-fault-low-1'
+  unlock_node 43982 'galv-fault-high-1'
+  unlock_node 43983 'galv-fault-high-2'
   wait_node 54981; wait_node 54982; wait_node 54983
 
   # Fault 1: Payload Byte Corruption
@@ -1700,8 +1860,9 @@ print(priv.public_key().public_bytes_raw().hex())
 [db]
 path = "$node_low_1/corrosion.db"
 schema_paths = ["$node_low_1/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43991"
 [[api.pg]]
 addr = "127.0.0.1:54991"
 [gossip]
@@ -1739,8 +1900,9 @@ EOF
 [db]
 path = "$node_high_1/corrosion.db"
 schema_paths = ["$node_high_1/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43992"
 [[api.pg]]
 addr = "127.0.0.1:54992"
 [gossip]
@@ -1777,8 +1939,9 @@ EOF
 [db]
 path = "$node_high_2/corrosion.db"
 schema_paths = ["$node_high_2/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43993"
 [[api.pg]]
 addr = "127.0.0.1:54993"
 [gossip]
@@ -1797,25 +1960,25 @@ format = "json"
 EOF
 
   echo "  START  Starting Low exporter and High receiver cluster"
-  GALVANIZE_DB_KEY="galv-schema-low-1" \
-    GALV_TEST_RSA_PUB="$rsa_pub_content" \
+  GALV_TEST_RSA_PUB="$rsa_pub_content" \
     GALV_TEST_ED25519_KEY="$low_priv_hex" \
     RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_low_1/config.toml" agent >"$node_low_1/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
-  GALVANIZE_DB_KEY="galv-schema-high-1" \
-    GALV_TEST_RSA_PRIV="$rsa_priv_content" \
+  GALV_TEST_RSA_PRIV="$rsa_priv_content" \
     GALV_TEST_PERMITTED_SENDER="$low_pub_hex" \
     RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_high_1/config.toml" agent >"$node_high_1/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
-  GALVANIZE_DB_KEY="galv-schema-high-2" \
-    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_high_2/config.toml" agent >"$node_high_2/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
+  unlock_node 43991 'galv-schema-low-1'
+  unlock_node 43992 'galv-schema-high-1'
+  unlock_node 43993 'galv-schema-high-2'
   wait_node 54991; wait_node 54992; wait_node 54993
 
   # Phase 1: Baseline Ingestion on Schema V1
@@ -1981,8 +2144,9 @@ CREATE TABLE IF NOT EXISTS high_records (
 [db]
 path = "$node_low_1/corrosion.db"
 schema_paths = ["$node_low_1/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43971"
 [[api.pg]]
 addr = "127.0.0.1:54971"
 [gossip]
@@ -2020,8 +2184,9 @@ EOF
 [db]
 path = "$node_high_1/corrosion.db"
 schema_paths = ["$node_high_1/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43972"
 [[api.pg]]
 addr = "127.0.0.1:54972"
 [gossip]
@@ -2058,8 +2223,9 @@ EOF
 [db]
 path = "$node_high_2/corrosion.db"
 schema_paths = ["$node_high_2/schema"]
+await-unlock = true
 [api]
-addr = "127.0.0.1:0"
+addr = "127.0.0.1:43973"
 [[api.pg]]
 addr = "127.0.0.1:54973"
 [gossip]
@@ -2078,25 +2244,25 @@ format = "json"
 EOF
 
   echo "  START  Starting Low exporter and High receiver cluster"
-  GALVANIZE_DB_KEY="galv-large-low-1" \
-    GALV_TEST_RSA_PUB="$rsa_pub_content" \
+  GALV_TEST_RSA_PUB="$rsa_pub_content" \
     GALV_TEST_ED25519_KEY="$low_priv_hex" \
     RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_low_1/config.toml" agent >"$node_low_1/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
-  GALVANIZE_DB_KEY="galv-large-high-1" \
-    GALV_TEST_RSA_PRIV="$rsa_priv_content" \
+  GALV_TEST_RSA_PRIV="$rsa_priv_content" \
     GALV_TEST_PERMITTED_SENDER="$low_pub_hex" \
     RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_high_1/config.toml" agent >"$node_high_1/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
-  GALVANIZE_DB_KEY="galv-large-high-2" \
-    RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::highlow=debug}" \
     "$binary" --config "$node_high_2/config.toml" agent >"$node_high_2/logs/agent.log" 2>&1 &
   cleanup_pids+=("$!")
 
+  unlock_node 43971 'galv-large-low-1'
+  unlock_node 43972 'galv-large-high-1'
+  unlock_node 43973 'galv-large-high-2'
   wait_node 54971; wait_node 54972; wait_node 54973
 
   # Phase 1: High-Volume Bulk Batch Transaction (1,000 Rows)
@@ -2354,10 +2520,11 @@ case "$scenario" in
   partition) partition ;;
   crash-recovery) crash_recovery ;;
   crdt-contention) crdt_contention ;;
+  views) views ;;
   highlow-faults) highlow_faults ;;
   highlow-schema) highlow_schema ;;
   large-payload) large_payload ;;
   benchmark) benchmark ;;
-  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; highlow_faults; highlow_schema; large_payload ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|highlow-schema|large-payload|benchmark|all}" >&2; exit 2 ;;
+  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; views; highlow_faults; highlow_schema; large_payload ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|views|highlow-faults|highlow-schema|large-payload|benchmark|all}" >&2; exit 2 ;;
 esac

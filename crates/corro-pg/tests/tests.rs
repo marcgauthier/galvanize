@@ -1055,7 +1055,6 @@ async fn test_pg_transaction_finalization_failures_recover() {
     wait_for_all_pending_handles().await;
 }
 
-#[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_readonly() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -1129,7 +1128,6 @@ async fn test_pg_readonly() {
     wait_for_all_pending_handles().await;
 }
 
-#[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_corrrosion_shutdown() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();

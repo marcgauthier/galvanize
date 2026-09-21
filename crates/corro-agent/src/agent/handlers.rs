@@ -278,7 +278,7 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tr
                     agent.config().gossip.bootstrap.as_slice(),
                     gossip_addr,
                     allow_mixed_ip,
-                    agent.pool(),
+                    &agent.pool(),
                 )
                 .await
                 {

@@ -95,11 +95,11 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
                 let start = Instant::now();
                 for (table_name, (retention, filter)) in tables.iter() {
                     let result = match reap_table(
-                        agent.pool(),
+                        &agent.pool(),
                         table_name,
                         *retention,
                         filter.as_deref(),
-                        clock,
+                        &clock,
                         &reaper_cfg,
                     )
                     .with_timeout(check_timeout)

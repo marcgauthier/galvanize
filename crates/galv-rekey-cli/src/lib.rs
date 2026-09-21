@@ -46,27 +46,26 @@ pub enum RekeyError {
     Io(#[from] std::io::Error),
 }
 
-/// Reads encryption configuration from environment variables:
-/// - `GALVANIZE_DB_KEY` (or `GALVANIZE_DB_PASSPHRASE`)
-/// - `GALVANIZE_DB_CIPHER` (optional)
-/// - `GALVANIZE_DB_CIPHER_PARAMS` (optional)
-pub fn get_env_key() -> Option<KeyPayload> {
-    let key = std::env::var("GALVANIZE_DB_KEY")
-        .or_else(|_| std::env::var("GALVANIZE_DB_PASSPHRASE"))
-        .ok()?;
+static ACTIVE_KEY: parking_lot::RwLock<Option<KeyPayload>> = parking_lot::RwLock::new(None);
 
-    if key.is_empty() {
-        return None;
-    }
+/// Sets the active in-memory encryption key payload from runtime unlock.
+pub fn set_active_key(key: KeyPayload) {
+    *ACTIVE_KEY.write() = Some(key);
+}
 
-    let cipher = std::env::var("GALVANIZE_DB_CIPHER").ok().filter(|s| !s.is_empty());
-    let cipher_params = std::env::var("GALVANIZE_DB_CIPHER_PARAMS").ok().filter(|s| !s.is_empty());
+/// Returns the active in-memory encryption key payload, if unlocked.
+pub fn get_active_key() -> Option<KeyPayload> {
+    ACTIVE_KEY.read().clone()
+}
 
-    Some(KeyPayload {
-        key,
-        cipher,
-        cipher_params,
-    })
+/// Clears the active in-memory encryption key payload.
+pub fn clear_active_key() {
+    *ACTIVE_KEY.write() = None;
+}
+
+/// Checks if an active encryption key has been provided in memory.
+pub fn is_unlocked() -> bool {
+    ACTIVE_KEY.read().is_some()
 }
 
 /// Applies SQLite3MC cipher settings and encryption key to an open connection.
@@ -78,6 +77,20 @@ pub fn apply_encryption_pragma(conn: &mut Connection, key: &KeyPayload) -> Resul
         conn.pragma_update(None, "cipher_params", params)?;
     }
     conn.pragma_update(None, "key", &key.key)?;
+    Ok(())
+}
+
+/// Verifies that a given key payload correctly opens the encrypted SQLite database.
+pub fn verify_key(db_path: &Path, key: &KeyPayload) -> Result<(), RekeyError> {
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let mut conn = Connection::open(db_path)?;
+    apply_encryption_pragma(&mut conn, key)?;
+    let res: Result<i64, _> = conn.query_row("SELECT count(*) FROM sqlite_schema;", [], |row| row.get(0));
+    if let Err(e) = res {
+        return Err(RekeyError::InvalidCurrentKey(e));
+    }
     Ok(())
 }
 

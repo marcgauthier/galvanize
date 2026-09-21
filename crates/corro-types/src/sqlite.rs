@@ -369,8 +369,8 @@ pub fn apply_key_if_present(
 ) -> rusqlite::Result<()> {
     if let Some(payload) = key {
         galv_rekey_cli::apply_encryption_pragma(conn, payload)?;
-    } else if let Some(env_key) = galv_rekey_cli::get_env_key() {
-        galv_rekey_cli::apply_encryption_pragma(conn, &env_key)?;
+    } else if let Some(active_key) = galv_rekey_cli::get_active_key() {
+        galv_rekey_cli::apply_encryption_pragma(conn, &active_key)?;
     }
     Ok(())
 }

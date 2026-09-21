@@ -428,7 +428,8 @@ fn process_incoming_bundle(
     manifest_name: &str,
 ) -> Result<Option<galv_highlow::apply::ApplyStats>, galv_highlow::Error> {
     let bookie_write = agent.bookie().write_lock_blocking();
-    let mut book_writer = bookie_write.write_tx(agent.booked());
+    let booked = agent.booked();
+    let mut book_writer = bookie_write.write_tx(&booked);
 
     let tx = conn.transaction().map_err(|e| {
         galv_highlow::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))

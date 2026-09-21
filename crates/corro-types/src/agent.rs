@@ -44,7 +44,7 @@ use crate::{
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{
-        apply_key_if_present, rusqlite_to_crsqlite_with_config,
+        apply_key_if_present, rusqlite_to_crsqlite, rusqlite_to_crsqlite_with_config,
         rusqlite_to_crsqlite_write_with_config, setup_conn_with_config, trace_heavy_queries,
         CrConn, Migration, SqlitePool, SqlitePoolError,
     },
@@ -62,6 +62,13 @@ pub struct Agent(Arc<AgentInner>);
 pub enum ApplyTrigger {
     Version(ActorId, CrsqlDbVersion),
     SchemaChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLockState {
+    AwaitingUnlock,
+    Unlocked,
 }
 
 pub struct AgentConfig {
@@ -103,20 +110,22 @@ pub struct AgentConfig {
 
     pub fatal_issue: Arc<OnceLock<String>>,
     pub shutdown_token: CancellationToken,
+
+    pub lock_state: AgentLockState,
 }
 
 pub struct AgentInner {
-    actor_id: ActorId,
-    pool: SplitPool,
+    actor_id: parking_lot::RwLock<ActorId>,
+    pool: parking_lot::RwLock<SplitPool>,
     config: ArcSwap<Config>,
     gossip_addr: SocketAddr,
     external_addr: Option<SocketAddr>,
     api_addr: SocketAddr,
     members: RwLock<Members>,
     metrics_tracker: MetricsTracker,
-    clock: Arc<uhlc::HLC>,
-    booked: Booked,
-    bookie: Bookie,
+    clock: parking_lot::RwLock<Arc<uhlc::HLC>>,
+    booked: parking_lot::RwLock<Booked>,
+    bookie: parking_lot::RwLock<Bookie>,
     tx_bcast: CorroSender<BroadcastInput>,
     tx_apply: CorroSender<ApplyTrigger>,
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
@@ -134,6 +143,8 @@ pub struct AgentInner {
     updates_manager: UpdatesManager,
     fatal_issue: Arc<OnceLock<String>>,
     shutdown_token: CancellationToken,
+    lock_state: Arc<parking_lot::RwLock<AgentLockState>>,
+    unlock_notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,17 +159,17 @@ impl Agent {
             BroadcastMethod::Plumtree => Broadcaster::Plumtree(config.tx_plumtree.clone()),
         };
         Self(Arc::new(AgentInner {
-            actor_id: config.actor_id,
-            pool: config.pool,
+            actor_id: parking_lot::RwLock::new(config.actor_id),
+            pool: parking_lot::RwLock::new(config.pool),
             config: config.config,
             gossip_addr: config.gossip_addr,
             external_addr: config.external_addr,
             api_addr: config.api_addr,
             members: config.members,
             metrics_tracker: config.metrics_tracker,
-            clock: config.clock,
-            booked: config.booked,
-            bookie: config.bookie,
+            clock: parking_lot::RwLock::new(config.clock),
+            booked: parking_lot::RwLock::new(config.booked),
+            bookie: parking_lot::RwLock::new(config.bookie),
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_clear_buf: config.tx_clear_buf,
@@ -178,7 +189,45 @@ impl Agent {
             updates_manager: config.updates_manager,
             fatal_issue: config.fatal_issue,
             shutdown_token: config.shutdown_token,
+            lock_state: Arc::new(parking_lot::RwLock::new(config.lock_state)),
+            unlock_notify: Arc::new(tokio::sync::Notify::new()),
         }))
+    }
+
+    pub fn lock_state(&self) -> AgentLockState {
+        *self.0.lock_state.read()
+    }
+
+    pub fn is_unlocked(&self) -> bool {
+        *self.0.lock_state.read() == AgentLockState::Unlocked
+    }
+
+    pub fn set_unlocked(&self) {
+        *self.0.lock_state.write() = AgentLockState::Unlocked;
+        self.0.unlock_notify.notify_waiters();
+    }
+
+    pub fn unlock_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.0.unlock_notify.clone()
+    }
+
+    pub fn apply_unlocked_state(
+        &self,
+        actor_id: ActorId,
+        pool: SplitPool,
+        clock: Arc<uhlc::HLC>,
+        schema: Schema,
+        bookie: Bookie,
+        booked: Booked,
+        cluster_id: ClusterId,
+    ) {
+        *self.0.actor_id.write() = actor_id;
+        *self.0.pool.write() = pool;
+        *self.0.clock.write() = clock;
+        *self.0.schema.write() = schema;
+        *self.0.bookie.write() = bookie;
+        *self.0.booked.write() = booked;
+        self.0.cluster_id.store(Arc::new(cluster_id));
     }
 
     pub fn actor<C: Into<Option<ClusterId>>, M: Into<Option<MemberId>>>(
@@ -187,7 +236,7 @@ impl Agent {
         member_id: M,
     ) -> Actor {
         Actor::new(
-            self.0.actor_id,
+            self.actor_id(),
             self.external_addr().unwrap_or_else(|| self.gossip_addr()),
             self.clock().new_timestamp().into(),
             cluster_id.into().unwrap_or_else(|| self.cluster_id()),
@@ -195,17 +244,17 @@ impl Agent {
         )
     }
 
-    /// Return a borrowed [SqlitePool]
-    pub fn pool(&self) -> &SplitPool {
-        &self.0.pool
+    /// Return a cloned [SplitPool] handle
+    pub fn pool(&self) -> SplitPool {
+        self.0.pool.read().clone()
     }
 
     pub fn actor_id(&self) -> ActorId {
-        self.0.actor_id
+        *self.0.actor_id.read()
     }
 
-    pub fn clock(&self) -> &Arc<uhlc::HLC> {
-        &self.0.clock
+    pub fn clock(&self) -> Arc<uhlc::HLC> {
+        self.0.clock.read().clone()
     }
 
     pub fn gossip_addr(&self) -> SocketAddr {
@@ -272,12 +321,12 @@ impl Agent {
         Handle::current().block_on(self.0.write_sema.clone().acquire_owned())
     }
 
-    pub fn booked(&self) -> &Booked {
-        &self.0.booked
+    pub fn booked(&self) -> Booked {
+        self.0.booked.read().clone()
     }
 
-    pub fn bookie(&self) -> &Bookie {
-        &self.0.bookie
+    pub fn bookie(&self) -> Bookie {
+        self.0.bookie.read().clone()
     }
 
     pub fn members(&self) -> &RwLock<Members> {
@@ -760,6 +809,33 @@ impl SplitPool {
         }))
     }
 
+    pub fn dummy() -> Self {
+        let (priority_tx, _) = bounded(1, "priority");
+        let (normal_tx, _) = bounded(1, "normal");
+        let (low_tx, _) = bounded(1, "low");
+        let rw_pool = sqlite_pool::Config::new(":memory:")
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)
+            .expect("in-memory pool");
+        let ro_pool = sqlite_pool::Config::new(":memory:")
+            .read_only()
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)
+            .expect("in-memory ro pool");
+        Self(Arc::new(SplitPoolInner {
+            path: PathBuf::from(":memory:"),
+            write_sema: Arc::new(Semaphore::new(1)),
+            cache_size_kib: 0,
+            mmap_size_bytes: 0,
+            journal_size_limit_bytes: 0,
+            read: ro_pool,
+            write: rw_pool,
+            priority_tx,
+            normal_tx,
+            low_tx,
+        }))
+    }
+
     pub fn emit_metrics(&self) {
         let read_state = self.0.read.status();
         gauge!("corro.sqlite.pool.read.connections").set(read_state.size as f64);
@@ -884,6 +960,12 @@ impl SplitPool {
             _drop_guard,
             _permit,
         })
+    }
+}
+
+impl Default for SplitPool {
+    fn default() -> Self {
+        Self::dummy()
     }
 }
 

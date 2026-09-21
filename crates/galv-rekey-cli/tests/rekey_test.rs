@@ -1,4 +1,7 @@
-use galv_rekey_cli::{apply_encryption_pragma, get_env_key, rekey_database, KeyPayload};
+use galv_rekey_cli::{
+    apply_encryption_pragma, clear_active_key, get_active_key, is_unlocked, rekey_database,
+    set_active_key, KeyPayload,
+};
 use rusqlite::Connection;
 use tempfile::tempdir;
 
@@ -89,17 +92,26 @@ fn test_rekey_encrypted_to_new_key_and_cipher() -> Result<(), Box<dyn std::error
 }
 
 #[test]
-fn test_get_env_key() {
-    std::env::set_var("GALVANIZE_DB_KEY", "env-secret-999");
-    std::env::set_var("GALVANIZE_DB_CIPHER", "chacha20");
-    std::env::set_var("GALVANIZE_DB_CIPHER_PARAMS", "kdf_iter=32000");
+fn test_active_key_management() {
+    clear_active_key();
+    assert!(!is_unlocked());
+    assert!(get_active_key().is_none());
 
-    let payload = get_env_key().expect("env key should be parsed");
-    assert_eq!(payload.key, "env-secret-999");
-    assert_eq!(payload.cipher.as_deref(), Some("chacha20"));
-    assert_eq!(payload.cipher_params.as_deref(), Some("kdf_iter=32000"));
+    let payload = KeyPayload {
+        key: "secret-key-123".into(),
+        cipher: Some("chacha20".into()),
+        cipher_params: Some("kdf_iter=32000".into()),
+    };
 
-    std::env::remove_var("GALVANIZE_DB_KEY");
-    std::env::remove_var("GALVANIZE_DB_CIPHER");
-    std::env::remove_var("GALVANIZE_DB_CIPHER_PARAMS");
+    set_active_key(payload);
+    assert!(is_unlocked());
+
+    let active = get_active_key().expect("key should be active");
+    assert_eq!(active.key, "secret-key-123");
+    assert_eq!(active.cipher.as_deref(), Some("chacha20"));
+    assert_eq!(active.cipher_params.as_deref(), Some("kdf_iter=32000"));
+
+    clear_active_key();
+    assert!(!is_unlocked());
+    assert!(get_active_key().is_none());
 }

@@ -4440,8 +4440,8 @@ impl<'conn> Session<'conn> {
         trace!("HANDLE COMMIT");
 
         let actor_id = self.agent.actor_id();
-
-        let mut book_writer = bookie_write.write_tx(self.agent.booked());
+        let booked = self.agent.booked();
+        let mut book_writer = bookie_write.write_tx(&booked);
 
         let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
         self.conn

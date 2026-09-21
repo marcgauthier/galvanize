@@ -12,7 +12,7 @@ GALVANIZE is for deployments that need distributed state without giving up contr
 
 ### Encryption at rest
 
-Local SQLite databases can be encrypted with SQLite3 Multiple Ciphers (SQLite3MC). Database keys are supplied through environment variables rather than stored in configuration files, and the `corrosion rekey` command supports safely rotating an existing database key while the agent is stopped.
+Local SQLite databases can be encrypted with SQLite3 Multiple Ciphers (SQLite3MC). To ensure zero plaintext secrets on the filesystem or environment, database keys are supplied dynamically via HTTP POST JSON to the Remote Unlock API (`POST /v1/admin/unlock`). In addition, the `corrosion rekey` CLI command supports safely rotating an existing database key while the agent is stopped.
 
 ### Cross-domain, unidirectional replication
 
@@ -56,7 +56,7 @@ The `corrosion` CLI provides administration and database access. The executable 
 ### Quick start
 
 - Prepare the agent configuration and initial database schema.
-- Configure `GALVANIZE_DB_KEY` (or `GALVANIZE_DB_PASSPHRASE`) before starting an encrypted node.
+- Start the node. If configured with `await_unlock = true` or using an existing encrypted database, unlock the node by sending `POST /v1/admin/unlock` with JSON `{"key": "your_passphrase", "cipher": "chacha20"}`.
 - Optionally set `[gossip.allow-list]` to allowed peer IP addresses and CIDRs; its default is `["*"]`.
 - Configure `[highlow]` with exactly one role (`low`, `high`, or `high-replica`) to enable cross-domain transfer.
 

@@ -293,10 +293,33 @@ pub struct HealthQuery {
     pub failure_status: Option<u16>,
 }
 
+/// Request payload for POST /v1/admin/unlock
+#[derive(Debug, Clone, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct UnlockRequest {
+    #[serde(alias = "passphrase")]
+    pub key: String,
+    #[zeroize(skip)]
+    pub cipher: Option<String>,
+    #[zeroize(skip)]
+    pub cipher_params: Option<String>,
+}
+
+/// Response payload for POST /v1/admin/unlock
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum UnlockResponse {
+    Ok { status: String },
+    Error { error: String },
+}
+
 /// Contains status information about the node
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(untagged)]
 pub enum HealthResponse {
+    AwaitingUnlock {
+        status: String,
+        db_path: String,
+    },
     Response {
         gaps: i64,
         members: i64,

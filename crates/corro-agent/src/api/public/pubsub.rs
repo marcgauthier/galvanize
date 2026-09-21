@@ -42,6 +42,15 @@ pub async fn api_v1_sub_by_id(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
+    if !agent.is_unlocked() {
+        return hyper::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&QueryEvent::Error("database is locked / awaiting unlock".into()))
+                    .expect("could not serialize error json"),
+            ))
+            .expect("could not build response");
+    }
     sub_by_id(agent.subs_manager(), id, params, &bcast_cache, tripwire).await
 }
 
@@ -51,7 +60,7 @@ async fn sub_by_id(
     params: SubParams,
     bcast_cache: &SharedMatcherBroadcastCache,
     tripwire: Tripwire,
-) -> impl IntoResponse {
+) -> hyper::Response<axum::body::Body> {
     let matcher_rx = bcast_cache.read().await.get(&id).and_then(|tx| {
         subs.get(&id).map(|matcher| {
             debug!("found matcher by id {id}");
@@ -673,6 +682,16 @@ pub async fn api_v1_subs(
     axum::extract::Query(params): axum::extract::Query<SubParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
+    if !agent.is_unlocked() {
+        return hyper::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&QueryEvent::Error("database is locked / awaiting unlock".into()))
+                    .expect("could not serialize error json"),
+            ))
+            .expect("could not build response");
+    }
+
     let stmt = match expand_sql(&agent, &stmt).await {
         Ok(stmt) => stmt,
         Err(e) => return hyper::Response::from(e),
@@ -688,7 +707,7 @@ pub async fn api_v1_subs(
         &stmt,
         &agent.config().db.subscriptions_path(),
         &agent.schema().read(),
-        agent.pool(),
+        &agent.pool(),
         tripwire.clone(),
     );
 

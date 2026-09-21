@@ -18,7 +18,7 @@ use corro_types::{
     agent::{Agent, ChangeError},
     api::{
         ColumnName, ExecResponse, ExecResult, HealthQuery, HealthResponse, QueryEvent, Statement,
-        TableStatRequest, TableStatResponse,
+        TableStatRequest, TableStatResponse, UnlockRequest, UnlockResponse,
     },
     base::CrsqlDbVersion,
     broadcast::Timestamp,
@@ -40,7 +40,8 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
+use tripwire::Tripwire;
 
 use corro_types::broadcast::broadcast_changes;
 
@@ -73,7 +74,8 @@ where
     block_in_place(move || {
         trace!("acquiring bookie write lock...");
         let bookie_write = agent.bookie().write_lock_blocking();
-        let mut book_writer = bookie_write.write_tx(agent.booked());
+        let booked = agent.booked();
+        let mut book_writer = bookie_write.write_tx(&booked);
 
         let tx = conn
             .immediate_transaction()
@@ -187,6 +189,19 @@ pub async fn api_v1_transactions(
     axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(statements): axum::extract::Json<Vec<Statement>>,
 ) -> (StatusCode, axum::Json<ExecResponse>) {
+    if !agent.is_unlocked() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(ExecResponse {
+                results: vec![ExecResult::Error {
+                    error: "database is locked / awaiting unlock".into(),
+                }],
+                time: 0.0,
+                version: None,
+                actor_id: None,
+            }),
+        );
+    }
     let actor_id = agent.actor_id().to_string();
     if statements.is_empty() {
         return (
@@ -460,6 +475,19 @@ pub async fn api_v1_queries(
     axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
+    if !agent.is_unlocked() {
+        return hyper::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(
+                serde_json::to_vec(&ExecResult::Error {
+                    error: "database is locked / awaiting unlock".into(),
+                })
+                .expect("could not serialize error json")
+                .into(),
+            )
+            .expect("could not build query response body");
+    }
+
     let (mut tx, body) = CountedBody::channel(
         persistent_gauge!("corro.api.active.streams", "source" => "queries", "protocol" => "http"),
     );
@@ -530,23 +558,22 @@ pub async fn api_v1_health(
     Extension(agent): Extension<Agent>,
     Query(query): Query<HealthQuery>,
 ) -> (StatusCode, axum::Json<HealthResponse>) {
+    if !agent.is_unlocked() {
+        return (
+            StatusCode::OK,
+            axum::Json(HealthResponse::AwaitingUnlock {
+                status: "awaiting_unlock".to_string(),
+                db_path: agent.config().db.path.to_string(),
+            }),
+        );
+    }
+
     match check_health(&agent).await {
         Ok((gaps, members)) => {
             let status = query.failure_status.unwrap_or(503);
             let error_status =
                 StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-            let p99_lag = match agent.metrics_tracker().quantile_lag(0.99) {
-                Some(lag) => lag,
-                None => {
-                    error!("no p99 lag information available");
-                    return (
-                        error_status,
-                        axum::Json(HealthResponse::Error(
-                            "no p99 lag information available".into(),
-                        )),
-                    );
-                }
-            };
+            let p99_lag = agent.metrics_tracker().quantile_lag(0.99).unwrap_or(0.0);
 
             let queue_size = agent.metrics_tracker().queue_size();
             let status = if query.gaps.is_some_and(|max| gaps > max)
@@ -609,6 +636,16 @@ pub async fn api_v1_table_stats(
     Extension(agent): Extension<Agent>,
     axum::extract::Json(ts_req): axum::extract::Json<TableStatRequest>,
 ) -> (StatusCode, axum::Json<TableStatResponse>) {
+    if !agent.is_unlocked() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(TableStatResponse {
+                total_row_count: 0,
+                invalid_tables: vec![],
+            }),
+        );
+    }
+
     async fn count_table_lengths(
         agent: &Agent,
         ts_req: TableStatRequest,
@@ -660,6 +697,88 @@ pub async fn api_v1_table_stats(
             }),
         ),
     }
+}
+
+/// Unlock the agent database with the provided key payload
+pub async fn api_v1_unlock(
+    Extension(agent): Extension<Agent>,
+    Extension(tripwire): Extension<Tripwire>,
+    axum::extract::Json(req): axum::extract::Json<UnlockRequest>,
+) -> (StatusCode, axum::Json<UnlockResponse>) {
+    if agent.is_unlocked() {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(UnlockResponse::Error {
+                error: "database is already unlocked".into(),
+            }),
+        );
+    }
+
+    let key_payload = galv_rekey_cli::KeyPayload {
+        key: req.key.clone(),
+        cipher: req.cipher.clone(),
+        cipher_params: req.cipher_params.clone(),
+    };
+
+    let db_path = agent.config().db.path.clone();
+    if let Err(e) = galv_rekey_cli::verify_key(db_path.as_std_path(), &key_payload) {
+        error!("Database unlock key verification failed: {e}");
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(UnlockResponse::Error {
+                error: "invalid database encryption key".into(),
+            }),
+        );
+    }
+
+    galv_rekey_cli::set_active_key(key_payload);
+
+    let state = match crate::agent::setup::init_database_state(
+        &agent.config(),
+        agent.write_sema().clone(),
+        &tripwire,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(e) => {
+            error!("Failed to initialize database state after unlock: {e}");
+            galv_rekey_cli::clear_active_key();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(UnlockResponse::Error {
+                    error: format!("database initialization failed: {e}"),
+                }),
+            );
+        }
+    };
+
+    agent.apply_unlocked_state(
+        state.actor_id,
+        state.pool,
+        state.clock,
+        state.schema,
+        state.bookie,
+        state.booked,
+        state.cluster_id,
+    );
+    agent.set_unlocked();
+
+    // Load schema from paths upon unlock
+    if let Err(e) = crate::agent::util::execute_schema_from_paths(&agent).await {
+        error!("could not execute schema from paths on unlock: {e}");
+    }
+
+    agent.unlock_notify().notify_waiters();
+
+    info!("Database successfully unlocked via Remote Unlock API");
+
+    (
+        StatusCode::OK,
+        axum::Json(UnlockResponse::Ok {
+            status: "unlocked".into(),
+        }),
+    )
 }
 
 #[cfg(test)]

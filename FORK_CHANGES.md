@@ -4,26 +4,44 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 
 ## Upstream Tracking & Changes Log
 
-### 1. Vendored SQLite3MC Crate
+### 1. Managed SQLite View Support
+- **Files:** `crates/corro-types/src/schema.rs`, `crates/corro-agent/src/agent/util.rs`, `crates/corro-agent/src/agent/tests.rs`, and `doc/schema.md`.
+- **Behavior:** Managed schema files now accept persistent `CREATE VIEW` (including `IF NOT EXISTS`) and `DROP VIEW IF EXISTS` statements. Views are persisted in `__corro_schema`, restored on startup, and updated transactionally after table/index work.
+- **Replication boundary:** Views remain ordinary local SQLite objects. They are never supplied to `crsql_as_crr`, do not create CR-SQLite metadata, and do not independently replicate data.
+- **Live coverage:** `tests-live/views` starts three encrypted nodes, writes through the PostgreSQL listener, verifies converged view results and replicated-table SHA-256 snapshots, and confirms the view is absent from `crsql_changes`.
+
+### 2. Vendored SQLite3MC Crate
 - **Crate:** [`crates/galv-libsqlite3-sys`](file:///home/marc/GALVANIZE/crates/galv-libsqlite3-sys)
 - **Version:** `0.36.0` (matching `rusqlite 0.38.0` dependency)
 - **SQLite3MC Version:** `2.5.1` (bundled with SQLite `3.53.4`)
 - **Features:** Static compilation of SQLite3MC amalgamation (`-DSQLITE3MC_STATIC=1`) with support for ChaCha20-Poly1305, AES-256-CBC, SQLCipher, wxSQLite3, and Ascon-128.
 
-### 2. Environment Variable Key Management & Offline CLI Rekey
-- **Crate:** [`crates/galv-rekey-cli`](file:///home/marc/GALVANIZE/crates/galv-rekey-cli)
-- **Environment Variables**:
-  - `GALVANIZE_DB_KEY` (or `GALVANIZE_DB_PASSPHRASE`): Encryption passphrase.
-  - `GALVANIZE_DB_CIPHER` (optional): `chacha20` (default), `aegis`, `aes256cbc`, `sqlcipher`, `ascon128`, etc.
-  - `GALVANIZE_DB_CIPHER_PARAMS` (optional): Extra cipher parameters.
+### 3. Remote Database Unlock API & Offline CLI Rekey
+- **Zero Runtime Environment Variable Secret Invariant**: The daemon runtime does not inspect `GALVANIZE_DB_KEY` or environment variables for database keys. All encryption parameters must be supplied dynamically via the Remote Unlock API.
+- **Remote Unlock Endpoint**: `POST /v1/admin/unlock` (and `POST /v1/unlock`)
+  - **Request Body (JSON)**:
+    ```json
+    {
+      "key": "db_passphrase_here",
+      "cipher": "chacha20",
+      "cipher_params": ""
+    }
+    ```
+  - **Behavior**:
+    - If a database is locked or configured with `await_unlock = true`, the agent boots into `AgentLockState::AwaitingUnlock`.
+    - When locked, `GET /v1/health` returns `200 OK` with `{"status": "awaiting_unlock", "db_path": "..."}`.
+    - All queries, transactions, subscriptions, and updates return `503 Service Unavailable` with `database is locked / awaiting unlock`.
+    - PostgreSQL wire listeners (`corro-pg`), SWIM gossip, QUIC transport, and sync loops are deferred and only launch once unlocked.
+    - Supplying invalid keys returns `401 Unauthorized` without crashing the daemon.
+    - On valid unlock, the active key is stored in zeroized memory, SQLite pool is created, migrations run, state transitions to `Unlocked`, and background services start.
 - **Offline CLI Command**: `corrosion rekey`
   - Interactive hidden prompts for current key, new key, and confirmation.
   - Verifies corrosion daemon is not running before rekeying.
   - Safely rekeys SQLite database using SQLite3MC and verifies data integrity.
   - Memory security: Passwords are automatically zeroized with `zeroize::ZeroizeOnDrop`.
-  - Automation: `--current-key-env NAME --new-key-env NAME` reads keys from named environment variables without exposing them in process arguments. The original prompt flow remains the default.
+  - Automation: `--current-key-env NAME --new-key-env NAME` reads keys from named environment variables without exposing them in process arguments for offline maintenance scripts.
 
-### 3. Root Workspace Configuration
+### 4. Root Workspace Configuration
 - **File:** [`Cargo.toml`](file:///home/marc/GALVANIZE/Cargo.toml)
 - Added `[patch.crates-io]` section:
   ```toml
@@ -31,11 +49,12 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
   libsqlite3-sys = { path = "crates/galv-libsqlite3-sys" }
   ```
 
-### 4. Tests & Verification
+### 5. Tests & Verification
 - **SQLite3MC Static Encryption Test:** [`crates/sqlite-pool/tests/sqlite3mc_encryption_test.rs`](file:///home/marc/GALVANIZE/crates/sqlite-pool/tests/sqlite3mc_encryption_test.rs)
 - **Offline CLI Rekey Tests:** [`crates/galv-rekey-cli/tests/rekey_test.rs`](file:///home/marc/GALVANIZE/crates/galv-rekey-cli/tests/rekey_test.rs)
+- **Remote Unlock Integration Test:** [`crates/corro-agent/tests/remote_unlock_test.rs`](file:///home/marc/GALVANIZE/crates/corro-agent/tests/remote_unlock_test.rs)
 
-### 5. Galvanize High/Low Air-Gap Replication
+### 6. Galvanize High/Low Air-Gap Replication
 - **Crate:** `crates/galv-highlow` (Galvanize-specific; no Vaultmesh wire compatibility).
 - **Format:** `galvanize-highlow/1` bundles are zstd-compressed (level 15), encrypted with a random XChaCha20-Poly1305 content key, RSA-OAEP (SHA-256) wrapped for the High receiver, and accompanied by an Ed25519-signed manifest. Payloads use `.zstd.galvh`; manifests use `.json.galv`.
 - **Transport Adapters:** Supports `directory` (local filesystem/USB staging), `http`/`https` (POST artifacts / GET manifests), `ftp`/`ftps`, and `sftp`.
@@ -45,9 +64,9 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **Safety boundaries:** artifact names cannot escape the selected transport directory; manifest/payload/decompressed sizes are bounded; hashes and signatures are verified before ingestion; schema hash mismatch is held as `waiting-schema`; SFTP configuration requires a SHA-256 host-key pin; endpoints cannot contain credentials.
 - **Durability:** internal `__galv_highlow_*` SQLite tables hold the Low event journal/outbox and High inbox/stream state. Receipt is idempotent and a missing sequence is recoverable rather than permanently quarantined.
 - **Agent lifecycle change:** when enabled, `corro-agent` creates that local journal before CR-SQLite initialization so bookkeeping tables are not enrolled as mesh-replicated user tables.
-- **Configuration:** Corrosion has a disabled-by-default `[highlow]` block. Enabling it requires exactly one role: `[highlow.low]`, `[highlow.high]`, or `[highlow.high-replica]`. Low and High require `[highlow.transport]`; secrets are environment-variable names, never ihttps://superfly.github.io/corrosion/nline credentials.
+- **Configuration:** Corrosion has a disabled-by-default `[highlow]` block. Enabling it requires exactly one role: `[highlow.low]`, `[highlow.high]`, or `[highlow.high-replica]`. Low and High require `[highlow.transport]`; secrets are environment-variable names, never inline credentials.
 
-### 6. Gossip Allow-List Replication Control
+### 7. Gossip Allow-List Replication Control
 - **Configuration:** `[gossip.allow-list]` (or `allow_list`).
 - **Default:** `["*"]` (wildcard, allowing all nodes to communicate without restriction).
 - **Functionality:** Restricts all cluster peer communication (SWIM gossip, broadcast replication, sync bi-streams, datagrams, and discovery bootstrap) to explicitly listed IPv4/IPv6 addresses, CIDR subnets (e.g. `10.0.0.0/8`, `192.168.1.0/24`), or wildcard `*`.
@@ -57,7 +76,7 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
   - Inbound connection refusal in [`crates/corro-agent/src/agent/handlers.rs`](file:///home/marc/GALVANIZE/crates/corro-agent/src/agent/handlers.rs) via `quinn::Incoming::refuse()`.
   - Discovery filtering in `spawn_swim_announcer`.
 
-### 7. Live PostgreSQL-Wire Node Tests
+### 8. Live PostgreSQL-Wire Node Tests
 - **Runner:** `bash tests-live/run.sh {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|highlow-faults|highlow-schema|large-payload|all}` (or individual `tests-live/<scenario>/run.sh`) after `cargo build -p corrosion`.
 - **Behavior:** each scenario creates isolated `node-*` folders, starts real Galvanize agents, and makes all application SQL requests through PostgreSQL wire listeners using `psql`.
 - **Retention:** successful runtime directories are removed. Failed runs are moved to `tests-live/failures/` with encrypted databases and agent logs for diagnosis.
@@ -70,7 +89,7 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **Large Payload & Bulk Batches:** 3-node cluster stress test validating 1,000-row atomic bulk batch transactions, multi-megabyte binary blob payloads (1.5 MB), Zstd level-15 compression/decompression, and 8 KiB chunked QUIC stream replication to bit-identical state across all mesh peers.
 - **Two-Node Benchmark:** Manual `tests-live/benchmark` scenario drives fully acknowledged 100-mutation PostgreSQL-wire transactions on one encrypted node for a configurable duration, measures convergence to a SHA-256-identical peer, and reports workload, replication-drain, and total logical protocol byte rates from Prometheus counters.
 
-### 8. SQLite Memory Mapping and WAL Journal Size Limit Configuration
+### 9. SQLite Memory Mapping and WAL Journal Size Limit Configuration
 - **Configuration:** Exposed under `[db]` in `config.toml`:
   - `mmap_size_bytes`: Maximum memory-mapped I/O size in bytes (`PRAGMA mmap_size`). Defaults to 8 GiB (`8589934592`). Setting to `0` disables memory mapping.
   - `journal_size_limit_bytes`: Maximum WAL journal file size limit in bytes (`PRAGMA journal_size_limit`). Truncates WAL files upon checkpoint. Defaults to 1 GiB (`1073741824`). Setting to `-1` allows unlimited WAL growth.
@@ -78,5 +97,3 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **Implementation:**
   - `DbConfig` and `ConfigBuilder` in [`crates/corro-types/src/config.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/config.rs).
   - Applied on all connection pools and dedicated write connections in [`crates/corro-types/src/sqlite.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/sqlite.rs) and [`crates/corro-types/src/agent.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/agent.rs).
-
-

@@ -376,6 +376,11 @@ pub struct DbConfig {
     pub schema_paths: Vec<Utf8PathBuf>,
     #[serde(default)]
     pub subscriptions_path: Option<Utf8PathBuf>,
+    /// Whether the database must wait for a remote unlock API call (POST /v1/admin/unlock)
+    /// before initializing the database connection pool, migrations, and background services.
+    /// Default: false (unless existing DB file is encrypted).
+    #[serde(default, alias = "await-unlock", alias = "encrypted")]
+    pub await_unlock: bool,
     /// SQLite page cache size in KiB for writes (negative value).
     /// Default: -1048576 (1 GB). Larger values improve write performance but use more RAM.
     /// WARNING: Setting this too low (<100MB) can severely degrade performance.
@@ -1022,6 +1027,7 @@ pub struct ConfigBuilder {
     compression_level: Option<i32>,
     broadcast: Option<BroadcastConfig>,
     allow_list: Option<AllowList>,
+    await_unlock: Option<bool>,
 }
 
 impl ConfigBuilder {
@@ -1156,6 +1162,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set whether the database awaits remote unlock via HTTP API.
+    pub fn await_unlock(mut self, await_unlock: bool) -> Self {
+        self.await_unlock = Some(await_unlock);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -1175,6 +1187,7 @@ impl ConfigBuilder {
                 path: db_path,
                 schema_paths: self.schema_paths,
                 subscriptions_path: None,
+                await_unlock: self.await_unlock.unwrap_or(false),
                 cache_size_kib: self.cache_size_kib.unwrap_or_else(default_cache_size_kib),
                 mmap_size_bytes: self.mmap_size_bytes.unwrap_or_else(default_mmap_size_bytes),
                 journal_size_limit_bytes: self.journal_size_limit_bytes.unwrap_or_else(default_journal_size_limit_bytes),

@@ -1540,18 +1540,68 @@ CREATE TABLE IF NOT EXISTS test_reload2 (
     "#;
     tokio::fs::write(schema_dir.join("index.sql"), index_sql.as_bytes()).await?;
 
+    let view_sql = r#"
+    CREATE VIEW test_reload_nonempty AS
+    SELECT id, note FROM test_reload WHERE note != '';
+    "#;
+    tokio::fs::write(schema_dir.join("view.sql"), view_sql.as_bytes()).await?;
+
     execute_schema_from_paths(&ta.agent).await?;
 
     let conn = ta.agent.pool().read().await?;
     assert!(check_obj_exists(&conn, "table", "test_reload"));
     assert!(check_obj_exists(&conn, "table", "test_reload2"));
     assert!(check_obj_exists(&conn, "index", "test_reload_note_idx"));
+    assert!(check_obj_exists(&conn, "view", "test_reload_nonempty"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM __corro_schema WHERE type = 'view' AND name = 'test_reload_nonempty'",
+            (),
+            |row| row.get::<_, i64>(0),
+        )?,
+        1
+    );
+    let restored_schema = corro_types::schema::init_schema(&conn)?;
+    assert!(restored_schema.views.contains_key("test_reload_nonempty"));
 
     {
         let schema = ta.agent.schema().read();
         assert!(schema.tables.get("test_reload").is_some());
         assert!(schema.tables.get("test_reload2").is_some());
+        assert!(schema.views.get("test_reload_nonempty").is_some());
     }
+
+    execute_schema(
+        &ta.agent,
+        vec![
+            "CREATE VIEW test_reload_nonempty AS SELECT id, note FROM test_reload WHERE note != '' AND id > 0;"
+                .to_owned(),
+        ],
+    )
+    .await?;
+    let conn = ta.agent.pool().read().await?;
+    let updated_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'test_reload_nonempty'",
+        (),
+        |row| row.get(0),
+    )?;
+    assert!(updated_sql.contains("id > 0"));
+
+    execute_schema(
+        &ta.agent,
+        vec!["DROP VIEW IF EXISTS test_reload_nonempty;".to_owned()],
+    )
+    .await?;
+    let conn = ta.agent.pool().read().await?;
+    assert!(!check_obj_exists(&conn, "view", "test_reload_nonempty"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM __corro_schema WHERE type = 'view' AND name = 'test_reload_nonempty'",
+            (),
+            |row| row.get::<_, i64>(0),
+        )?,
+        0
+    );
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;

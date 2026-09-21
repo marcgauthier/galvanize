@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 eyre = { workspace = true }
+parking_lot = { workspace = true }
 rpassword = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
