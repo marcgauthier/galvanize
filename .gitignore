@@ -11,3 +11,5 @@ benchmark_results/*
 /tests-live/failures
 /tests-live/runtime
 /tests-live/*/runtime
+__pycache__/
+*.pyc

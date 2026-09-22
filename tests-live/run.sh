@@ -54,10 +54,13 @@ trap cleanup EXIT
 
 unlock_node() {
   local api_port=$1 key=$2
+  local escaped_key
+  escaped_key=${key//\\/\\\\}
+  escaped_key=${escaped_key//\"/\\\"}
   local deadline=$((SECONDS + timeout_seconds))
-  until curl -fsS -X POST "http://127.0.0.1:$api_port/v1/admin/unlock" \
-    -H "Content-Type: application/json" \
-    -d "{\"key\": \"$key\", \"cipher\": \"chacha20\"}" >/dev/null 2>&1; do
+  until printf '{"key":"%s","cipher":"chacha20"}' "$escaped_key" | \
+    curl -fsS -X POST "http://127.0.0.1:$api_port/v1/admin/unlock" \
+      -H "Content-Type: application/json" --data-binary @- >/dev/null 2>&1; do
     (( SECONDS < deadline )) || { echo "Failed to unlock node on port $api_port" >&2; return 1; }
     sleep 0.1
   done
@@ -2357,6 +2360,10 @@ sys.stdout.write('COMMIT;\n')
   finish "$runtime" 0
 }
 
+long_running_five_node() {
+  exec "$root/tests-live/long-running-five-node/run.sh"
+}
+
 benchmark() {
   local runtime="$runtime_root/benchmark"
   local pg_a=55081 pg_b=55082 metrics_a=56081 metrics_b=56082
@@ -2524,7 +2531,8 @@ case "$scenario" in
   highlow-faults) highlow_faults ;;
   highlow-schema) highlow_schema ;;
   large-payload) large_payload ;;
+  long-running-five-node) long_running_five_node ;;
   benchmark) benchmark ;;
   all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; views; highlow_faults; highlow_schema; large_payload ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|views|highlow-faults|highlow-schema|large-payload|benchmark|all}" >&2; exit 2 ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|views|highlow-faults|highlow-schema|large-payload|long-running-five-node|benchmark|all}" >&2; exit 2 ;;
 esac
