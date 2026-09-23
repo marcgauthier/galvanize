@@ -9,6 +9,10 @@ use crate::{
     agent::{handlers, CountedExecutor, TO_CLEAR_COUNT},
     api::public::{
         api_v1_health, api_v1_queries, api_v1_table_stats, api_v1_transactions, api_v1_unlock,
+        files::{
+            api_v1_files_delete, api_v1_files_get, api_v1_files_metadata, api_v1_files_peer_fetch,
+            api_v1_files_search, api_v1_files_stats, api_v1_files_sync, api_v1_files_upload,
+        },
         pubsub::{api_v1_sub_by_id, api_v1_subs},
         update::SharedUpdateBroadcastCache,
     },
@@ -333,6 +337,21 @@ pub async fn setup_http_api_handler(
                     .layer(ConcurrencyLimitLayer::new(4)),
             ),
         )
+        // File APIs
+        .route("/v1/files/upload", post(api_v1_files_upload))
+        .route("/v1/files/search", get(api_v1_files_search))
+        .route("/v1/files/stats", get(api_v1_files_stats))
+        .route("/v1/files/sync", post(api_v1_files_sync))
+        .route(
+            "/v1/files/{uuid}",
+            get(api_v1_files_get)
+                .post(api_v1_files_upload)
+                .delete(api_v1_files_delete),
+        )
+        .route("/v1/files/{uuid}/metadata", get(api_v1_files_metadata))
+        .route("/v1/files/{uuid}/peer_fetch", get(api_v1_files_peer_fetch))
+        .route("/v1/files", get(api_v1_files_search).post(api_v1_files_upload))
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .layer(axum::middleware::from_fn(require_authz))
         .layer(
             tower::ServiceBuilder::new()

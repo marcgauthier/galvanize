@@ -1,27 +1,31 @@
 [package]
-name = "galv-highlow"
+name = "galv-files"
 version = "0.1.0-alpha.1"
 edition.workspace = true
 license.workspace = true
-description = "Galvanize one-way high/low air-gap replication"
+description = "Galvanize encrypted-at-rest file storage, APIs, and High/Low air-gap replication"
 
 [dependencies]
-base64.workspace = true
 chacha20poly1305.workspace = true
-ed25519-dalek.workspace = true
+galv-highlow = { path = "../galv-highlow" }
+galv-rekey-cli = { path = "../galv-rekey-cli" }
 getrandom.workspace = true
 hex.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+rand.workspace = true
 rsa.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+ssh2.workspace = true
 suppaftp.workspace = true
 thiserror.workspace = true
-time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 url.workspace = true
-zstd.workspace = true
+uuid.workspace = true
+camino.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
 tempfile.workspace = true

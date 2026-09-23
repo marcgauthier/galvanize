@@ -22,7 +22,9 @@ use corro_types::{
     },
     base::CrsqlDbVersion,
     broadcast::Timestamp,
-    change::{insert_local_changes, InsertChangesInfo, SqliteValue},
+    change::{
+        capture_highlow_ownership_for_actor, insert_local_changes, InsertChangesInfo, SqliteValue,
+    },
     persistent_gauge,
     sqlite::SqlitePoolError,
 };
@@ -48,6 +50,8 @@ use corro_types::broadcast::broadcast_changes;
 pub mod pubsub;
 
 pub mod update;
+
+pub mod files;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct TimeoutParams {
@@ -106,6 +110,9 @@ where
         let ret = f(&tx)?;
 
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
+        if let Some(info) = &insert_info {
+            capture_highlow_ownership_for_actor(agent, &tx, actor_id, info.db_version)?;
+        }
         tx.commit().map_err(|source| {
             let ce = ChangeError::Rusqlite {
                 source,

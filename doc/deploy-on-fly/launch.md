@@ -194,13 +194,13 @@ COPY . .
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \
-    cargo build --release && mv target/release/corrosion ./
+    cargo build --release -p corrosion --bin galvanize && mv target/release/galvanize ./
 
 # Runtime image
 FROM debian:bookworm-slim
 
 RUN apt update && apt install -y sqlite3 watch && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/local/bin/nperf /usr/src/app/corrosion /usr/local/bin/
+COPY --from=builder /usr/local/bin/nperf /usr/src/app/galvanize /usr/local/bin/
 
 # Create "corrosion" user
 RUN useradd -ms /bin/bash corrosion
@@ -210,7 +210,7 @@ COPY examples/fly/corrosion-files/ /etc/corrosion/
 
 ENTRYPOINT ["/entrypoint.sh"]
 # Run the app
-CMD ["corrosion", "agent"]
+CMD ["galvanize", "agent"]
 ```
 
 

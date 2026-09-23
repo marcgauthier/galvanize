@@ -48,6 +48,7 @@ pub fn initialize_store(connection: &Connection) -> Result<()> {
            stream_id TEXT NOT NULL,
            sequence INTEGER NOT NULL,
            event_json BLOB NOT NULL,
+           committed_at_ms INTEGER NOT NULL DEFAULT 0,
            exported_at_ms INTEGER,
            PRIMARY KEY (stream_id, sequence)
          ) WITHOUT ROWID;
@@ -76,9 +77,126 @@ pub fn initialize_store(connection: &Connection) -> Result<()> {
            highest_contiguous_sequence INTEGER NOT NULL DEFAULT 0,
            updated_at_ms INTEGER NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS __galv_highlow_provenance (
+           table_name TEXT NOT NULL,
+           primary_key_json TEXT NOT NULL,
+           stream_id TEXT NOT NULL,
+           low_first_applied_at_ms INTEGER NOT NULL,
+           low_last_applied_at_ms INTEGER NOT NULL,
+           last_high_override_at_ms INTEGER,
+           high_owned_fields_json TEXT NOT NULL DEFAULT '[]',
+           PRIMARY KEY (table_name, primary_key_json)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS __galv_highlow_replay_jobs (
+           job_id TEXT PRIMARY KEY,
+           state TEXT NOT NULL,
+           scope TEXT NOT NULL,
+           since_utc TEXT,
+           end_sequence INTEGER NOT NULL,
+           cursor_sequence INTEGER NOT NULL DEFAULT 0,
+           total_events INTEGER NOT NULL DEFAULT 0,
+           replayed_events INTEGER NOT NULL DEFAULT 0,
+           bundle_count INTEGER NOT NULL DEFAULT 0,
+           created_at_ms INTEGER NOT NULL,
+           started_at_ms INTEGER,
+           completed_at_ms INTEGER,
+           error TEXT
+         );
+         CREATE TABLE IF NOT EXISTS __galv_highlow_replay_logs (
+           job_id TEXT NOT NULL,
+           ordinal INTEGER NOT NULL,
+           at_ms INTEGER NOT NULL,
+           level TEXT NOT NULL,
+           message TEXT NOT NULL,
+           PRIMARY KEY (job_id, ordinal)
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS __galv_highlow_worker_results (
+           kind TEXT PRIMARY KEY,
+           state TEXT NOT NULL,
+           bundle_id TEXT,
+           stream_id TEXT,
+           event_count INTEGER,
+           updated_at_ms INTEGER NOT NULL,
+           error TEXT
+         );
          COMMIT;",
         )
-        .map_err(sql_error)
+        .map_err(sql_error)?;
+    // Older Galvanize journals predate the durable replay timestamp. SQLite
+    // cannot add a non-constant expression as a column default, so retain the
+    // existing event JSON as the source of truth and backfill conservatively.
+    let has_committed_at = connection
+        .prepare("PRAGMA table_info(__galv_highlow_events)")
+        .map_err(sql_error)?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_error)?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == "committed_at_ms");
+    if !has_committed_at {
+        connection.execute("ALTER TABLE __galv_highlow_events ADD COLUMN committed_at_ms INTEGER NOT NULL DEFAULT 0", []).map_err(sql_error)?;
+    }
+    Ok(())
+}
+
+/// A stable JSON representation used as the provenance primary-key key.
+pub fn canonical_primary_key(
+    primary_key: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String> {
+    if primary_key.is_empty() {
+        return Err(Error::Configuration("primary key is empty".into()));
+    }
+    serde_json::to_string(primary_key).map_err(json_error)
+}
+
+pub fn remove_provenance(
+    tx: &Connection,
+    table: &str,
+    primary_key: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM __galv_highlow_provenance WHERE table_name = ?1 AND primary_key_json = ?2",
+        params![table, canonical_primary_key(primary_key)?],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+pub fn high_owned_fields(
+    tx: &Connection,
+    table: &str,
+    primary_key: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<String>> {
+    let stored: Option<String> = tx.query_row("SELECT high_owned_fields_json FROM __galv_highlow_provenance WHERE table_name = ?1 AND primary_key_json = ?2", params![table, canonical_primary_key(primary_key)?], |r| r.get(0)).optional().map_err(sql_error)?;
+    stored
+        .map(|s| serde_json::from_str(&s).map_err(json_error))
+        .transpose()
+        .map(|v| v.unwrap_or_default())
+}
+
+pub fn mark_low_origin(tx: &Connection, event: &Event) -> Result<()> {
+    let key = canonical_primary_key(&event.primary_key)?;
+    let now = now_ms()?;
+    tx.execute("INSERT INTO __galv_highlow_provenance (table_name, primary_key_json, stream_id, low_first_applied_at_ms, low_last_applied_at_ms) VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT(table_name, primary_key_json) DO UPDATE SET stream_id = excluded.stream_id, low_last_applied_at_ms = excluded.low_last_applied_at_ms", params![event.table, key, event.stream_id, now]).map_err(sql_error)?;
+    Ok(())
+}
+
+/// Records a local High change only if the row was previously Low-origin.
+pub fn mark_high_ownership(
+    tx: &Connection,
+    table: &str,
+    primary_key: &serde_json::Map<String, serde_json::Value>,
+    columns: &[String],
+) -> Result<()> {
+    let key = canonical_primary_key(primary_key)?;
+    let old: Option<String> = tx.query_row("SELECT high_owned_fields_json FROM __galv_highlow_provenance WHERE table_name=?1 AND primary_key_json=?2", params![table, key], |r| r.get(0)).optional().map_err(sql_error)?;
+    let Some(old) = old else {
+        return Ok(());
+    };
+    let mut owned: std::collections::BTreeSet<String> =
+        serde_json::from_str(&old).map_err(json_error)?;
+    owned.extend(columns.iter().filter(|c| identifier(c)).cloned());
+    tx.execute("UPDATE __galv_highlow_provenance SET high_owned_fields_json=?3, last_high_override_at_ms=?4 WHERE table_name=?1 AND primary_key_json=?2", params![table, canonical_primary_key(primary_key)?, serde_json::to_string(&owned).map_err(json_error)?, now_ms()?]).map_err(sql_error)?;
+    Ok(())
 }
 
 /// Appends already committed Low-side events. Sequence allocation remains at
@@ -87,14 +205,15 @@ pub fn initialize_store(connection: &Connection) -> Result<()> {
 pub fn append_events(transaction: &Transaction<'_>, events: &[Event]) -> Result<()> {
     validate_events(events)?;
     let mut statement = transaction.prepare_cached(
-        "INSERT INTO __galv_highlow_events (stream_id, sequence, event_json) VALUES (?1, ?2, ?3)",
+        "INSERT INTO __galv_highlow_events (stream_id, sequence, event_json, committed_at_ms) VALUES (?1, ?2, ?3, ?4)",
     ).map_err(sql_error)?;
     for event in events {
         statement
             .execute(params![
                 event.stream_id,
                 event.sequence,
-                serde_json::to_vec(event).map_err(json_error)?
+                serde_json::to_vec(event).map_err(json_error)?,
+                event.committed_at_ms,
             ])
             .map_err(sql_error)?;
     }
@@ -128,6 +247,190 @@ pub fn pending_events(
         validate_events(&events)?;
     }
     Ok(events)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayScope {
+    All,
+    Since,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayJob {
+    pub job_id: String,
+    pub state: String,
+    pub scope: ReplayScope,
+    pub since_utc: Option<String>,
+    pub end_sequence: i64,
+    pub cursor_sequence: i64,
+    pub total_events: i64,
+    pub replayed_events: i64,
+    pub bundle_count: i64,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// Creates the sole active replay job. The end sequence is snapshotted so
+/// concurrent Low writes remain scheduled-export work, not replay work.
+pub fn create_replay_job(
+    connection: &mut Connection,
+    stream_id: &str,
+    scope: ReplayScope,
+    since_utc: Option<&str>,
+) -> Result<ReplayJob> {
+    let tx = connection.transaction().map_err(sql_error)?;
+    let active: Option<String> = tx.query_row("SELECT job_id FROM __galv_highlow_replay_jobs WHERE state IN ('queued','running') LIMIT 1", [], |r| r.get(0)).optional().map_err(sql_error)?;
+    if active.is_some() {
+        return Err(Error::Configuration("replay-conflict".into()));
+    }
+    let end: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM __galv_highlow_events WHERE stream_id=?1",
+            [stream_id],
+            |r| r.get(0),
+        )
+        .map_err(sql_error)?;
+    let count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM __galv_highlow_events WHERE stream_id=?1",
+            [stream_id],
+            |r| r.get(0),
+        )
+        .map_err(sql_error)?;
+    let now = now_ms()?;
+    let job_id = hex::encode(Sha256::digest(
+        format!("{stream_id}:{now}:{end}").as_bytes(),
+    ));
+    tx.execute("DELETE FROM __galv_highlow_replay_jobs", [])
+        .map_err(sql_error)?;
+    tx.execute("DELETE FROM __galv_highlow_replay_logs", [])
+        .map_err(sql_error)?;
+    tx.execute("INSERT INTO __galv_highlow_replay_jobs (job_id,state,scope,since_utc,end_sequence,total_events,created_at_ms) VALUES (?1,'queued',?2,?3,?4,?5,?6)", params![job_id, match scope { ReplayScope::All => "all", ReplayScope::Since => "since" }, since_utc, end, count, now]).map_err(sql_error)?;
+    tx.commit().map_err(sql_error)?;
+    Ok(ReplayJob {
+        job_id,
+        state: "queued".into(),
+        scope,
+        since_utc: since_utc.map(str::to_owned),
+        end_sequence: end,
+        cursor_sequence: 0,
+        total_events: count,
+        replayed_events: 0,
+        bundle_count: 0,
+        created_at_ms: now,
+        started_at_ms: None,
+        completed_at_ms: None,
+        error: None,
+    })
+}
+
+pub fn latest_replay_job(connection: &Connection) -> Result<Option<ReplayJob>> {
+    connection.query_row("SELECT job_id,state,scope,since_utc,end_sequence,cursor_sequence,total_events,replayed_events,bundle_count,created_at_ms,started_at_ms,completed_at_ms,error FROM __galv_highlow_replay_jobs ORDER BY created_at_ms DESC LIMIT 1", [], replay_job_from_row).optional().map_err(sql_error)
+}
+
+fn replay_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplayJob> {
+    Ok(ReplayJob {
+        job_id: row.get(0)?,
+        state: row.get(1)?,
+        scope: match row.get::<_, String>(2)?.as_str() {
+            "since" => ReplayScope::Since,
+            _ => ReplayScope::All,
+        },
+        since_utc: row.get(3)?,
+        end_sequence: row.get(4)?,
+        cursor_sequence: row.get(5)?,
+        total_events: row.get(6)?,
+        replayed_events: row.get(7)?,
+        bundle_count: row.get(8)?,
+        created_at_ms: row.get(9)?,
+        started_at_ms: row.get(10)?,
+        completed_at_ms: row.get(11)?,
+        error: row.get(12)?,
+    })
+}
+
+pub fn replay_events(
+    connection: &Connection,
+    stream_id: &str,
+    job: &ReplayJob,
+    maximum: usize,
+) -> Result<Vec<Event>> {
+    if maximum == 0 || maximum > MAX_EVENTS_PER_BUNDLE {
+        return Err(Error::Configuration("invalid replay-event limit".into()));
+    }
+    let mut stmt = connection.prepare("SELECT event_json FROM __galv_highlow_events WHERE stream_id=?1 AND sequence>?2 AND sequence<=?3 AND (?4 IS NULL OR committed_at_ms>=?4) ORDER BY sequence LIMIT ?5").map_err(sql_error)?;
+    let since_ms = job.since_utc.as_deref().map(parse_rfc3339_ms).transpose()?;
+    let rows = stmt
+        .query_map(
+            params![
+                stream_id,
+                job.cursor_sequence,
+                job.end_sequence,
+                since_ms,
+                maximum as i64
+            ],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .map_err(sql_error)?;
+    rows.map(|r| serde_json::from_slice(&r.map_err(sql_error)?).map_err(json_error))
+        .collect()
+}
+
+pub fn update_replay_job(
+    transaction: &Transaction<'_>,
+    job_id: &str,
+    cursor: i64,
+    events: usize,
+    completed: bool,
+    error: Option<&str>,
+) -> Result<()> {
+    let now = now_ms()?;
+    transaction.execute("UPDATE __galv_highlow_replay_jobs SET state=CASE WHEN ?4 THEN 'completed' WHEN ?5 IS NOT NULL THEN 'failed' ELSE 'running' END, cursor_sequence=?2, replayed_events=replayed_events+?3, bundle_count=bundle_count+CASE WHEN ?3>0 THEN 1 ELSE 0 END, started_at_ms=COALESCE(started_at_ms, ?6), completed_at_ms=CASE WHEN ?4 OR ?5 IS NOT NULL THEN ?6 ELSE NULL END, error=?5 WHERE job_id=?1", params![job_id,cursor,events as i64,completed,error,now]).map_err(sql_error)?;
+    let ordinal: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM __galv_highlow_replay_logs WHERE job_id=?1",
+            [job_id],
+            |r| r.get(0),
+        )
+        .map_err(sql_error)?;
+    let message = match (completed, error) {
+        (_, Some(error)) => format!("replay failed: {error}"),
+        (true, None) => "replay completed".into(),
+        _ => format!("replayed {events} retained event(s) through sequence {cursor}"),
+    };
+    transaction.execute("INSERT INTO __galv_highlow_replay_logs (job_id,ordinal,at_ms,level,message) VALUES (?1,?2,?3,?4,?5)", params![job_id,ordinal,now,if error.is_some() { "error" } else { "info" },message]).map_err(sql_error)?;
+    transaction.execute("DELETE FROM __galv_highlow_replay_logs WHERE job_id=?1 AND ordinal NOT IN (SELECT ordinal FROM __galv_highlow_replay_logs WHERE job_id=?1 ORDER BY ordinal DESC LIMIT 200)", [job_id]).map_err(sql_error)?;
+    Ok(())
+}
+
+pub fn record_worker_result(
+    connection: &Connection,
+    kind: &str,
+    state: &str,
+    bundle_id: Option<&str>,
+    stream_id: Option<&str>,
+    event_count: Option<i64>,
+    error: Option<&str>,
+) -> Result<()> {
+    connection.execute("INSERT INTO __galv_highlow_worker_results (kind,state,bundle_id,stream_id,event_count,updated_at_ms,error) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(kind) DO UPDATE SET state=excluded.state,bundle_id=excluded.bundle_id,stream_id=excluded.stream_id,event_count=excluded.event_count,updated_at_ms=excluded.updated_at_ms,error=excluded.error", params![kind,state,bundle_id,stream_id,event_count,now_ms()?,error]).map_err(sql_error)?;
+    Ok(())
+}
+
+pub fn worker_result(connection: &Connection, kind: &str) -> Result<Option<serde_json::Value>> {
+    connection.query_row("SELECT state,bundle_id,stream_id,event_count,updated_at_ms,error FROM __galv_highlow_worker_results WHERE kind=?1", [kind], |r| Ok(serde_json::json!({"state":r.get::<_,String>(0)?,"bundle_id":r.get::<_,Option<String>>(1)?,"stream_id":r.get::<_,Option<String>>(2)?,"event_count":r.get::<_,Option<i64>>(3)?,"updated_at_ms":r.get::<_,i64>(4)?,"error":r.get::<_,Option<String>>(5)?}))).optional().map_err(sql_error)
+}
+
+fn parse_rfc3339_ms(value: &str) -> Result<i64> {
+    let parsed = time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| Error::Configuration("since_utc must be RFC3339 UTC".into()))?;
+    if parsed.offset() != time::UtcOffset::UTC {
+        return Err(Error::Configuration("since_utc must use UTC (Z)".into()));
+    }
+    i64::try_from(parsed.unix_timestamp_nanos() / 1_000_000)
+        .map_err(|_| Error::Configuration("since_utc out of range".into()))
 }
 
 pub fn record_outbox(
@@ -814,5 +1117,31 @@ mod tests {
         assert!(register_received(&tx, &bundle).unwrap());
         assert!(!register_received(&tx, &bundle).unwrap());
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn replay_job_is_exclusive_and_keeps_export_watermark() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_store(&connection).unwrap();
+        let tx = connection.transaction().unwrap();
+        append_events(&tx, &[event()]).unwrap();
+        tx.commit().unwrap();
+        let job = create_replay_job(&mut connection, "low-a", ReplayScope::All, None).unwrap();
+        assert!(matches!(
+            create_replay_job(&mut connection, "low-a", ReplayScope::All, None),
+            Err(Error::Configuration(_))
+        ));
+        assert_eq!(
+            replay_events(&connection, "low-a", &job, 1).unwrap().len(),
+            1
+        );
+        let exported: Option<i64> = connection
+            .query_row(
+                "SELECT exported_at_ms FROM __galv_highlow_events",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exported, None);
     }
 }

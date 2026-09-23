@@ -28,6 +28,7 @@ foca = { workspace = true }
 futures = { workspace = true }
 galv-rekey-cli = { path = "../galv-rekey-cli" }
 galv-highlow = { path = "../galv-highlow" }
+galv-files = { path = "../galv-files" }
 hex = { workspace = true }
 hickory-resolver = { workspace = true }
 http.workspace = true
@@ -47,6 +48,7 @@ quinn-plaintext = { workspace = true }
 quoted-string = { workspace = true }
 rand = { workspace = true }
 rangemap = { workspace = true }
+reqwest = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
 seahash = { workspace = true }
@@ -64,6 +66,7 @@ time = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

@@ -129,6 +129,32 @@ pub struct Config {
     /// Optional one-way Low -> High air-gap replication. Disabled by default.
     #[serde(default)]
     pub highlow: HighLowConfig,
+    /// Optional file upload, storage, and airgap replication.
+    #[serde(default)]
+    pub files: FilesConfig,
+}
+
+const fn default_airgap_poll_interval() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct FilesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub accept_uploads: bool,
+    #[serde(default)]
+    pub accept_from_peers: bool,
+    #[serde(default)]
+    pub push_to_high: bool,
+    #[serde(default)]
+    pub sync_airgap_files: bool,
+    pub storage_path: Option<Utf8PathBuf>,
+    pub max_file_size_bytes: Option<u64>,
+    #[serde(default = "default_airgap_poll_interval")]
+    pub airgap_poll_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -140,6 +166,20 @@ pub struct HighLowConfig {
     pub low: Option<HighLowLowConfig>,
     pub high: Option<HighLowHighConfig>,
     pub high_replica: Option<HighLowHighReplicaConfig>,
+    #[serde(default)]
+    pub control_api: Option<HighLowControlApiConfig>,
+}
+
+/// Dedicated HTTPS API for High/Low control operations. TLS material is read
+/// from named environment variables so it never appears in configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HighLowControlApiConfig {
+    pub addr: SocketAddr,
+    pub server_cert_env: String,
+    pub server_key_env: String,
+    pub client_ca_cert_env: String,
+    pub authoritative_high_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,8 +220,14 @@ impl HighLowTransportConfig {
             HighLowTransportKind::Http => galv_highlow::transport::TransportKind::Http,
             HighLowTransportKind::Https => galv_highlow::transport::TransportKind::Https,
         };
-        let password = self.password_env.as_deref().and_then(|env| std::env::var(env).ok());
-        let bearer_token = self.bearer_token_env.as_deref().and_then(|env| std::env::var(env).ok());
+        let password = self
+            .password_env
+            .as_deref()
+            .and_then(|env| std::env::var(env).ok());
+        let bearer_token = self
+            .bearer_token_env
+            .as_deref()
+            .and_then(|env| std::env::var(env).ok());
         galv_highlow::transport::TransportConfig {
             kind,
             endpoint: self.endpoint.clone(),
@@ -205,13 +251,21 @@ pub struct HighLowLowConfig {
 
 impl HighLowLowConfig {
     pub fn recipient_rsa_public_key(&self) -> Result<String, String> {
-        std::env::var(&self.recipient_rsa_public_key_env)
-            .map_err(|_| format!("environment variable {} for recipient RSA public key not found", self.recipient_rsa_public_key_env))
+        std::env::var(&self.recipient_rsa_public_key_env).map_err(|_| {
+            format!(
+                "environment variable {} for recipient RSA public key not found",
+                self.recipient_rsa_public_key_env
+            )
+        })
     }
 
     pub fn sender_signing_key(&self) -> Result<String, String> {
-        std::env::var(&self.sender_signing_key_env)
-            .map_err(|_| format!("environment variable {} for sender Ed25519 signing key not found", self.sender_signing_key_env))
+        std::env::var(&self.sender_signing_key_env).map_err(|_| {
+            format!(
+                "environment variable {} for sender Ed25519 signing key not found",
+                self.sender_signing_key_env
+            )
+        })
     }
 }
 
@@ -227,15 +281,20 @@ pub struct HighLowHighConfig {
 
 impl HighLowHighConfig {
     pub fn recipient_rsa_private_key(&self) -> Result<String, String> {
-        std::env::var(&self.recipient_rsa_private_key_env)
-            .map_err(|_| format!("environment variable {} for recipient RSA private key not found", self.recipient_rsa_private_key_env))
+        std::env::var(&self.recipient_rsa_private_key_env).map_err(|_| {
+            format!(
+                "environment variable {} for recipient RSA private key not found",
+                self.recipient_rsa_private_key_env
+            )
+        })
     }
 
     pub fn permitted_sender_keys(&self) -> Result<Vec<String>, String> {
         let mut keys = Vec::new();
         for env_name in &self.permitted_sender_key_envs {
-            let key = std::env::var(env_name)
-                .map_err(|_| format!("environment variable {env_name} for permitted sender key not found"))?;
+            let key = std::env::var(env_name).map_err(|_| {
+                format!("environment variable {env_name} for permitted sender key not found")
+            })?;
             keys.push(key);
         }
         Ok(keys)
@@ -329,6 +388,34 @@ impl HighLowConfig {
                 return Err(ConfigError::HighLow(
                     "high-replica.accepted-streams must not be empty".into(),
                 ));
+            }
+        }
+        if let Some(control) = &self.control_api {
+            if control.server_cert_env.is_empty()
+                || control.server_key_env.is_empty()
+                || control.client_ca_cert_env.is_empty()
+            {
+                return Err(ConfigError::HighLow(
+                    "control-api TLS environment variable names must not be empty".into(),
+                ));
+            }
+            if self.high_replica.is_some()
+                && control
+                    .authoritative_high_url
+                    .as_deref()
+                    .filter(|url| url.starts_with("https://"))
+                    .is_none()
+            {
+                return Err(ConfigError::HighLow(
+                    "high-replica control-api requires an https authoritative-high-url".into(),
+                ));
+            }
+            if let Some(url) = &control.authoritative_high_url {
+                if !url.starts_with("https://") {
+                    return Err(ConfigError::HighLow(
+                        "control-api authoritative-high-url must use https".into(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -584,7 +671,11 @@ pub struct GossipConfig {
     #[serde(default = "default_broadcast_config")]
     pub broadcast: BroadcastConfig,
     /// Allowed peers IP/CIDR/host filter. Defaults to ["*"] (all peers allowed).
-    #[serde(default = "default_allow_list", alias = "allow_list", alias = "allow-list")]
+    #[serde(
+        default = "default_allow_list",
+        alias = "allow_list",
+        alias = "allow-list"
+    )]
     pub allow_list: AllowList,
 }
 
@@ -617,11 +708,14 @@ impl Default for AllowList {
 impl AllowList {
     pub fn new(rules: Vec<AllowRule>) -> Self {
         Self {
-            raw: rules.iter().map(|r| match r {
-                AllowRule::Wildcard => "*".to_string(),
-                AllowRule::Ip(ip) => ip.to_string(),
-                AllowRule::Network(net) => net.to_string(),
-            }).collect(),
+            raw: rules
+                .iter()
+                .map(|r| match r {
+                    AllowRule::Wildcard => "*".to_string(),
+                    AllowRule::Ip(ip) => ip.to_string(),
+                    AllowRule::Network(net) => net.to_string(),
+                })
+                .collect(),
             rules,
         }
     }
@@ -965,6 +1059,16 @@ impl Config {
         ConfigBuilder::default()
     }
 
+    pub fn files_path(&self) -> Utf8PathBuf {
+        if let Some(p) = &self.files.storage_path {
+            p.clone()
+        } else if let Some(parent) = self.db.path.parent() {
+            parent.join("files")
+        } else {
+            Utf8PathBuf::from("files")
+        }
+    }
+
     /// Reads configuration from a TOML file, given its path. Environment
     /// variables can override whatever is set in the config file.
     pub fn load(config_path: &str) -> Result<Self, ConfigError> {
@@ -1190,7 +1294,9 @@ impl ConfigBuilder {
                 await_unlock: self.await_unlock.unwrap_or(false),
                 cache_size_kib: self.cache_size_kib.unwrap_or_else(default_cache_size_kib),
                 mmap_size_bytes: self.mmap_size_bytes.unwrap_or_else(default_mmap_size_bytes),
-                journal_size_limit_bytes: self.journal_size_limit_bytes.unwrap_or_else(default_journal_size_limit_bytes),
+                journal_size_limit_bytes: self
+                    .journal_size_limit_bytes
+                    .unwrap_or_else(default_journal_size_limit_bytes),
             },
             api: ApiConfig {
                 bind_addr: self.api_addr,
@@ -1235,6 +1341,7 @@ impl ConfigBuilder {
             consul: self.consul,
             reaper: self.reaper,
             highlow: HighLowConfig::default(),
+            files: FilesConfig::default(),
         })
     }
 }
@@ -1508,8 +1615,12 @@ mod tests {
             "allow_list": ["192.168.1.0/24"]
         }))
         .unwrap();
-        assert!(cfg2.allow_list.is_allowed(&"192.168.1.50:8787".parse().unwrap()));
-        assert!(!cfg2.allow_list.is_allowed(&"10.0.0.1:8787".parse().unwrap()));
+        assert!(cfg2
+            .allow_list
+            .is_allowed(&"192.168.1.50:8787".parse().unwrap()));
+        assert!(!cfg2
+            .allow_list
+            .is_allowed(&"10.0.0.1:8787".parse().unwrap()));
     }
 
     #[test]
@@ -1522,7 +1633,10 @@ mod tests {
         assert_eq!(db.path, "/var/lib/corrosion/corrosion.db");
         assert_eq!(db.cache_size_kib, DEFAULT_CACHE_SIZE_KIB);
         assert_eq!(db.mmap_size_bytes, DEFAULT_MMAP_SIZE_BYTES);
-        assert_eq!(db.journal_size_limit_bytes, DEFAULT_JOURNAL_SIZE_LIMIT_BYTES);
+        assert_eq!(
+            db.journal_size_limit_bytes,
+            DEFAULT_JOURNAL_SIZE_LIMIT_BYTES
+        );
 
         // Custom values
         let db_custom: DbConfig = serde_json::from_value(serde_json::json!({

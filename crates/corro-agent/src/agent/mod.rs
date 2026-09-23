@@ -9,6 +9,7 @@ mod bootstrap;
 mod error;
 mod handlers;
 pub mod highlow;
+pub mod files_sync;
 mod metrics;
 mod reaper;
 mod run_root;

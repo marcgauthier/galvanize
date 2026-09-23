@@ -25,7 +25,7 @@ use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, BookieWriteGuard, ChangeError},
     broadcast::{broadcast_changes, Timestamp},
-    change::{insert_local_changes, InsertChangesInfo},
+    change::{capture_highlow_ownership_for_actor, insert_local_changes, InsertChangesInfo},
     config::PgConfig,
     persistent_gauge,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
@@ -4444,6 +4444,9 @@ impl<'conn> Session<'conn> {
         let mut book_writer = bookie_write.write_tx(&booked);
 
         let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
+        if let Some(info) = &insert_info {
+            capture_highlow_ownership_for_actor(&self.agent, self.conn, actor_id, info.db_version)?;
+        }
         self.conn
             .execute_batch("COMMIT")
             .map_err(|source| ChangeError::Rusqlite {

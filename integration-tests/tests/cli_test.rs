@@ -5,9 +5,9 @@ use once_cell::sync::Lazy;
 use spawn::wait_for_all_pending_handles;
 use tripwire::Tripwire;
 
-static CORROSION_BIN: Lazy<CargoRun> = Lazy::new(|| {
+static GALVANIZE_BIN: Lazy<CargoRun> = Lazy::new(|| {
     escargot::CargoBuild::new()
-        .bin("corrosion")
+        .bin("galvanize")
         .manifest_path("../Cargo.toml")
         .run()
         .unwrap()
@@ -15,14 +15,14 @@ static CORROSION_BIN: Lazy<CargoRun> = Lazy::new(|| {
 
 #[test]
 fn test_help() {
-    let mut cmd = CORROSION_BIN.command();
+    let mut cmd = GALVANIZE_BIN.command();
 
     cmd.arg("--help").assert().success();
 }
 
 #[test]
 fn test_consul_sync_requires_consul_config() {
-    let mut cmd = CORROSION_BIN.command();
+    let mut cmd = GALVANIZE_BIN.command();
     let config_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config.example.toml");
 
@@ -43,7 +43,7 @@ async fn test_query() {
         .await
         .unwrap();
 
-    let mut cmd = CORROSION_BIN.command();
+    let mut cmd = GALVANIZE_BIN.command();
 
     let api_addr = ta.agent.api_addr();
 

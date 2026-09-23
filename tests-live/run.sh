@@ -4,7 +4,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 scenario=${1:-all}
-binary=${GALVANIZE_BIN:-"$root/target/debug/corrosion"}
+binary=${GALVANIZE_BIN:-"$root/target/debug/galvanize"}
 runtime_root=${GALVANIZE_LIVE_RUNTIME:-"$root/tests-live/runtime"}
 timeout_seconds=${GALVANIZE_LIVE_TIMEOUT_SECONDS:-30}
 write_seconds=${GALVANIZE_LIVE_WRITE_SECONDS:-180}
@@ -21,9 +21,11 @@ contention_write_seconds=${GALVANIZE_LIVE_CONTENTION_WRITE_SECONDS:-15}
 contention_settle_seconds=${GALVANIZE_LIVE_CONTENTION_SETTLE_SECONDS:-25}
 benchmark_write_seconds=${GALVANIZE_LIVE_BENCHMARK_WRITE_SECONDS:-30}
 benchmark_sync_timeout_seconds=${GALVANIZE_LIVE_BENCHMARK_SYNC_TIMEOUT_SECONDS:-120}
+files_soak_duration_seconds=${GALVANIZE_LIVE_FILES_SOAK_DURATION_SECONDS:-600}
+files_soak_interval_seconds=${GALVANIZE_LIVE_FILES_SOAK_INTERVAL_SECONDS:-60}
 started_at=$SECONDS
 
-[[ -x "$binary" ]] || { echo "build first: cargo build -p corrosion" >&2; exit 2; }
+[[ -x "$binary" ]] || { echo "build first: cargo build -p corrosion --bin galvanize" >&2; exit 2; }
 command -v psql >/dev/null || { echo "psql is required for live tests" >&2; exit 2; }
 
 cleanup_pids=()
@@ -2519,11 +2521,544 @@ PY
   finish "$runtime" 0
 }
 
+files() {
+  local runtime="$runtime_root/files"
+  rm -rf "$runtime"; mkdir -p "$runtime/staging"; active_runtime=$runtime
+  echo "== files: Upload, Encrypted Store, Peer Fetch & High/Low Air-Gap Replication =="
+  echo "  TOPOLOGY  Low Domain: 2 nodes (Low-1 is Exporter & Uploads enabled, Low-2 is Peer)"
+  echo "            High Domain: 2 nodes (High-1 is Receiver & Airgap Sync enabled, High-2 is Peer)"
+  echo "            Air-Gap: Directory staging"
+
+  # 1. Generate RSA keypair for High node
+  openssl genpkey -algorithm RSA -out "$runtime/high_rsa_priv.pem" -pkeyopt rsa_keygen_bits:2048 2>/dev/null
+  openssl rsa -in "$runtime/high_rsa_priv.pem" -pubout -out "$runtime/high_rsa_pub.pem" 2>/dev/null
+
+  # 2. Generate Ed25519 signing key for Low node
+  local keys_out
+  keys_out=$(python3 -c "
+from cryptography.hazmat.primitives.asymmetric import ed25519
+priv = ed25519.Ed25519PrivateKey.generate()
+print(priv.private_bytes_raw().hex())
+print(priv.public_key().public_bytes_raw().hex())
+")
+  local low_priv_hex low_pub_hex
+  low_priv_hex=$(echo "$keys_out" | head -n1)
+  low_pub_hex=$(echo "$keys_out" | tail -n1)
+
+  local staging_endpoint="$runtime/staging"
+  local rsa_pub_content rsa_priv_content
+  rsa_pub_content=$(cat "$runtime/high_rsa_pub.pem")
+  rsa_priv_content=$(cat "$runtime/high_rsa_priv.pem")
+
+  local db_key_low="passphrase_low_cluster_secret_99"
+  local db_key_high="passphrase_high_cluster_secret_77"
+
+  local common_schema="CREATE TABLE IF NOT EXISTS live_records (id INTEGER PRIMARY KEY NOT NULL, val TEXT NOT NULL DEFAULT '') WITHOUT ROWID;"
+
+  # Write Low Node 1 (Accept Uploads + Push to High)
+  local node_low_1="$runtime/node-low-1"
+  mkdir -p "$node_low_1/schema" "$node_low_1/logs"
+  echo "$common_schema" >"$node_low_1/schema/live.sql"
+  cat >"$node_low_1/config.toml" <<EOF
+[db]
+path = "$node_low_1/corrosion.db"
+schema_paths = ["$node_low_1/schema"]
+await-unlock = true
+[api]
+addr = "127.0.0.1:47031"
+[[api.pg]]
+addr = "127.0.0.1:54931"
+[gossip]
+addr = "127.0.0.1:48031"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48032"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_low_1/admin.sock"
+[log]
+format = "json"
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$staging_endpoint"
+[highlow.low]
+stream-id = "stream-files-1"
+network-name = "net-files"
+upload-interval-seconds = 1
+recipient-key-id = "high-rsa-key"
+recipient-rsa-public-key-env = "GALV_TEST_RSA_PUB"
+sender-signing-key-env = "GALV_TEST_ED25519_KEY"
+[files]
+enabled = true
+accept-uploads = true
+accept-from-peers = true
+push-to-high = true
+airgap-poll-interval-seconds = 1
+EOF
+
+  # Write Low Node 2 (Peer)
+  local node_low_2="$runtime/node-low-2"
+  mkdir -p "$node_low_2/schema" "$node_low_2/logs"
+  echo "$common_schema" >"$node_low_2/schema/live.sql"
+  cat >"$node_low_2/config.toml" <<EOF
+[db]
+path = "$node_low_2/corrosion.db"
+schema_paths = ["$node_low_2/schema"]
+await-unlock = true
+[api]
+addr = "127.0.0.1:47032"
+[[api.pg]]
+addr = "127.0.0.1:54932"
+[gossip]
+addr = "127.0.0.1:48032"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48031"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_low_2/admin.sock"
+[log]
+format = "json"
+[files]
+enabled = true
+accept-uploads = false
+accept-from-peers = true
+EOF
+
+  # Write High Node 1 (Airgap Receiver + Sync airgap files)
+  local node_high_1="$runtime/node-high-1"
+  mkdir -p "$node_high_1/schema" "$node_high_1/logs"
+  echo "$common_schema" >"$node_high_1/schema/live.sql"
+  cat >"$node_high_1/config.toml" <<EOF
+[db]
+path = "$node_high_1/corrosion.db"
+schema_paths = ["$node_high_1/schema"]
+await-unlock = true
+[api]
+addr = "127.0.0.1:47041"
+[[api.pg]]
+addr = "127.0.0.1:54941"
+[gossip]
+addr = "127.0.0.1:48041"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48042"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_high_1/admin.sock"
+[log]
+format = "json"
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$staging_endpoint"
+[highlow.high]
+accepted-streams = ["stream-files-1"]
+download-interval-seconds = 1
+recipient-key-id = "high-rsa-key"
+recipient-rsa-private-key-env = "GALV_TEST_RSA_PRIV"
+permitted-sender-key-envs = ["GALV_TEST_PERMITTED_SENDER"]
+[files]
+enabled = true
+accept-uploads = false
+accept-from-peers = true
+sync-airgap-files = true
+airgap-poll-interval-seconds = 1
+EOF
+
+  # Write High Node 2 (High Peer)
+  local node_high_2="$runtime/node-high-2"
+  mkdir -p "$node_high_2/schema" "$node_high_2/logs"
+  echo "$common_schema" >"$node_high_2/schema/live.sql"
+  cat >"$node_high_2/config.toml" <<EOF
+[db]
+path = "$node_high_2/corrosion.db"
+schema_paths = ["$node_high_2/schema"]
+await-unlock = true
+[api]
+addr = "127.0.0.1:47042"
+[[api.pg]]
+addr = "127.0.0.1:54942"
+[gossip]
+addr = "127.0.0.1:48042"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48041"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node_high_2/admin.sock"
+[log]
+format = "json"
+[files]
+enabled = true
+accept-uploads = false
+accept-from-peers = true
+EOF
+
+  # Start Low Nodes
+  echo "  START  node LOW-1 (Uploads & Exporter) api=47031 pg=54931 gossip=48031"
+  GALV_TEST_RSA_PUB="$rsa_pub_content" \
+  GALV_TEST_ED25519_KEY="$low_priv_hex" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::files_sync=debug,corro_agent::api::public::files=debug}" \
+    "$binary" --config "$node_low_1/config.toml" agent >"$node_low_1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  echo "  START  node LOW-2 (Peer) api=47032 pg=54932 gossip=48032"
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info}" \
+    "$binary" --config "$node_low_2/config.toml" agent >"$node_low_2/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  # Start High Nodes
+  echo "  START  node HIGH-1 (Airgap Receiver & Sync) api=47041 pg=54941 gossip=48041"
+  GALV_TEST_RSA_PRIV="$rsa_priv_content" \
+  GALV_TEST_PERMITTED_SENDER="$low_pub_hex" \
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::agent::files_sync=debug,corro_agent::api::public::files=debug}" \
+    "$binary" --config "$node_high_1/config.toml" agent >"$node_high_1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  echo "  START  node HIGH-2 (Peer) api=47042 pg=54942 gossip=48042"
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info}" \
+    "$binary" --config "$node_high_2/config.toml" agent >"$node_high_2/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  echo "  UNLOCK unlocking all nodes via HTTP Remote Unlock API"
+  unlock_node 47031 "$db_key_low"
+  unlock_node 47032 "$db_key_low"
+  unlock_node 47041 "$db_key_high"
+  unlock_node 47042 "$db_key_high"
+
+  wait_node 54931; wait_node 54932
+  wait_node 54941; wait_node 54942
+
+  echo "  UPLOAD uploading test files to Low Node 1"
+  local file1_uuid="f0000000-1111-2222-3333-444455556666"
+  local file1_content="GALVANIZE_CLASSIFIED_PAYLOAD_DOCUMENT_1234567890_ABCDEF"
+  local file1_sha256
+  file1_sha256=$(printf "%s" "$file1_content" | sha256sum | awk '{print $1}')
+
+  local file2_uuid="f0000000-9999-8888-7777-666655554444"
+  local file2_content="DIAGRAM_PNG_BINARY_CONTENT_SIMULATION_9876543210"
+  local file2_sha256
+  file2_sha256=$(printf "%s" "$file2_content" | sha256sum | awk '{print $1}')
+
+  local upload_resp
+  upload_resp=$(curl -fsS -X POST "http://127.0.0.1:47031/v1/files/upload?uuid=$file1_uuid&filename=classified_report.pdf" \
+    -H "Content-Type: application/pdf" \
+    --data-binary "$file1_content")
+  echo "  UPLOAD response file1: $upload_resp"
+  echo "$upload_resp" | grep -q '"status":"ok"' || { echo "Upload file 1 failed: $upload_resp" >&2; return 1; }
+  echo "$upload_resp" | grep -q "$file1_sha256" || { echo "SHA-256 mismatch in upload response" >&2; return 1; }
+
+  local upload2_resp
+  upload2_resp=$(curl -fsS -X POST "http://127.0.0.1:47031/v1/files/upload?uuid=$file2_uuid&filename=network_diagram.png" \
+    -H "Content-Type: image/png" \
+    --data-binary "$file2_content")
+  echo "  UPLOAD response file2: $upload2_resp"
+  echo "$upload2_resp" | grep -q '"status":"ok"' || { echo "Upload file 2 failed: $upload2_resp" >&2; return 1; }
+
+  echo "  CHECK  staged file artifacts are encrypted, not plaintext"
+  local staged_file
+  for staged_file in "$staging_endpoint/$file1_uuid.file" "$staging_endpoint/$file2_uuid.file"; do
+    [[ -f "$staged_file" ]] || { echo "Missing sealed artifact: $staged_file" >&2; return 1; }
+    [[ $(head -c 8 "$staged_file") == "GALVFILE" ]] || { echo "Unsealed artifact: $staged_file" >&2; return 1; }
+  done
+  if grep -Fq "$file1_content" "$staging_endpoint/$file1_uuid.file" ||
+     grep -Fq "$file2_content" "$staging_endpoint/$file2_uuid.file"; then
+    echo "Plaintext file content leaked to air-gap staging" >&2; return 1
+  fi
+
+  echo "  CHECK  verifying files table on Low Node 1 via PostgreSQL wire"
+  local count_low1
+  count_low1=$(psql "postgresql://postgres@127.0.0.1:54931/postgres" -tA -qc "SELECT count(*) FROM files WHERE uuid IN ('$file1_uuid', '$file2_uuid');")
+  [[ "$count_low1" == "2" ]] || { echo "Expected 2 rows in files on Low-1, got $count_low1" >&2; return 1; }
+
+  echo "  REPLICATE waiting for Low Node 2 mesh gossip convergence"
+  local deadline=$((SECONDS + timeout_seconds))
+  local count_low2=0
+  until (( count_low2 == 2 || SECONDS >= deadline )); do
+    count_low2=$(psql "postgresql://postgres@127.0.0.1:54932/postgres" -tA -qc "SELECT count(*) FROM files WHERE uuid IN ('$file1_uuid', '$file2_uuid');" 2>/dev/null || echo 0)
+    sleep 0.2
+  done
+  [[ "$count_low2" == "2" ]] || { echo "Files metadata did not converge to Low-2" >&2; return 1; }
+
+  echo "  PEER_FETCH Low Node 2 downloading file1 via peer fetch"
+  local downloaded_low2
+  downloaded_low2=$(curl -fsS "http://127.0.0.1:47032/v1/files/$file1_uuid")
+  [[ "$downloaded_low2" == "$file1_content" ]] || { echo "Low-2 peer fetched corrupted content: $downloaded_low2" >&2; return 1; }
+  echo "  CHECK  Low Node 2 peer fetch verified bit-identical!"
+
+  echo "  AIRGAP waiting for High Node 1 air-gap synchronization"
+  local count_high1=0
+  deadline=$((SECONDS + timeout_seconds + 15))
+  until (( count_high1 == 2 || SECONDS >= deadline )); do
+    count_high1=$(psql "postgresql://postgres@127.0.0.1:54941/postgres" -tA -qc "SELECT count(*) FROM files WHERE uuid IN ('$file1_uuid', '$file2_uuid');" 2>/dev/null || echo 0)
+    sleep 0.3
+  done
+  [[ "$count_high1" == "2" ]] || { echo "High-1 did not receive files table rows via airgap bundle" >&2; return 1; }
+
+  echo "  DOWNLOAD polling High Node 1 for air-gap payload download & decrypt"
+  local downloaded_high1=""
+  deadline=$((SECONDS + timeout_seconds + 15))
+  until [[ "$downloaded_high1" == "$file1_content" ]] || (( SECONDS >= deadline )); do
+    downloaded_high1=$(curl -fsS "http://127.0.0.1:47041/v1/files/$file1_uuid" 2>/dev/null || echo "")
+    sleep 0.3
+  done
+  [[ "$downloaded_high1" == "$file1_content" ]] || { echo "High-1 file payload did not match expected: $downloaded_high1" >&2; return 1; }
+  echo "  CHECK  High Node 1 downloaded & decrypted payload bit-identically across air-gap!"
+
+  echo "  PEER_FETCH High Node 2 downloading file1 via peer fetch"
+  local downloaded_high2
+  downloaded_high2=$(curl -fsS "http://127.0.0.1:47042/v1/files/$file1_uuid")
+  [[ "$downloaded_high2" == "$file1_content" ]] || { echo "High-2 peer fetched corrupted content: $downloaded_high2" >&2; return 1; }
+  echo "  CHECK  High Node 2 peer fetch verified bit-identical!"
+
+  echo "  SEARCH testing file search API on High Node 1"
+  local search_resp
+  search_resp=$(curl -fsS "http://127.0.0.1:47041/v1/files/search?name=classified")
+  echo "$search_resp" | grep -q "$file1_uuid" || { echo "Search failed to find classified report: $search_resp" >&2; return 1; }
+  echo "  CHECK  File search verified successfully"
+
+  echo "  STATS testing file stats API on High Node 1"
+  local stats_resp
+  stats_resp=$(curl -fsS "http://127.0.0.1:47041/v1/files/stats")
+  echo "$stats_resp" | grep -q '"total_files":2' || { echo "Stats mismatch: $stats_resp" >&2; return 1; }
+  echo "  CHECK  File stats API verified successfully"
+
+  echo "  DELETE testing file deletion cascade"
+  local delete_resp
+  delete_resp=$(curl -fsS -X DELETE "http://127.0.0.1:47031/v1/files/$file2_uuid")
+  echo "$delete_resp" | grep -q '"deleted":"'"$file2_uuid"'"' || { echo "Delete failed: $delete_resp" >&2; return 1; }
+
+  deadline=$((SECONDS + timeout_seconds))
+  local remaining_count=2
+  until (( remaining_count == 0 || SECONDS >= deadline )); do
+    remaining_count=$(psql "postgresql://postgres@127.0.0.1:54931/postgres" -tA -qc "SELECT count(*) FROM files WHERE uuid = '$file2_uuid';" 2>/dev/null || echo 1)
+    sleep 0.2
+  done
+  [[ "$remaining_count" == "0" ]] || { echo "Deleted file record still present in files table" >&2; return 1; }
+  echo "  CHECK  File delete cascade verified successfully"
+
+  echo "  CHECK  All file upload, storage, search, peer-fetch & air-gap tests PASSED!"
+  finish "$runtime" 0
+}
+
+
+# ---------------------------------------------------------------------------
+# files-soak: 10-minute (configurable) continuous upload/download/search test
+#
+# Two-node cluster (LOW-1 accepts uploads, LOW-2 peer-fetches).
+# Uploads one uniquely named file every $files_soak_interval_seconds seconds,
+# downloads all previously uploaded files from LOW-2, and searches after each
+# round. Asserts bit-identical content on every peer-fetch.
+# ---------------------------------------------------------------------------
+files_soak() {
+  local runtime="$runtime_root/files-soak"
+  rm -rf "$runtime"; mkdir -p "$runtime"; active_runtime=$runtime
+
+  local rounds=$(( files_soak_duration_seconds / files_soak_interval_seconds ))
+  local db_key="passphrase_files_soak_secret_42"
+
+  echo "== files-soak: Long-Running Upload / Download / Search Soak =="
+  echo "  PLAN  ${rounds} rounds × ${files_soak_interval_seconds}s = ${files_soak_duration_seconds}s total"
+  echo "  TOPO  LOW-1 api=47051 pg=54951 (uploads enabled)"
+  echo "        LOW-2 api=47052 pg=54952 (peer-fetch node)"
+
+  local common_schema
+  common_schema='CREATE TABLE IF NOT EXISTS live_records (id INTEGER PRIMARY KEY NOT NULL, val TEXT NOT NULL DEFAULT '"'"''"'"') WITHOUT ROWID;'
+
+  # ── Write LOW-1 config ──────────────────────────────────────────────────
+  local node1="$runtime/node-low-1"
+  mkdir -p "$node1/schema" "$node1/logs"
+  echo "$common_schema" > "$node1/schema/live.sql"
+  cat > "$node1/config.toml" <<EOF
+[db]
+path = "$node1/corrosion.db"
+schema_paths = ["$node1/schema"]
+await-unlock = true
+[api]
+addr = "127.0.0.1:47051"
+[[api.pg]]
+addr = "127.0.0.1:54951"
+[gossip]
+addr = "127.0.0.1:48051"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48052"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node1/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+[files]
+enabled = true
+accept-uploads = true
+accept-from-peers = true
+EOF
+
+  # ── Write LOW-2 config ──────────────────────────────────────────────────
+  local node2="$runtime/node-low-2"
+  mkdir -p "$node2/schema" "$node2/logs"
+  echo "$common_schema" > "$node2/schema/live.sql"
+  cat > "$node2/config.toml" <<EOF
+[db]
+path = "$node2/corrosion.db"
+schema_paths = ["$node2/schema"]
+await-unlock = true
+[api]
+addr = "127.0.0.1:47052"
+[[api.pg]]
+addr = "127.0.0.1:54952"
+[gossip]
+addr = "127.0.0.1:48052"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = ["127.0.0.1:48051"]
+plaintext = true
+allow-list = ["*"]
+[admin]
+path = "$node2/admin.sock"
+[perf]
+min_sync_backoff = 1
+max_sync_backoff = 2
+[log]
+format = "json"
+[files]
+enabled = true
+accept-uploads = false
+accept-from-peers = true
+EOF
+
+  # ── Start nodes ──────────────────────────────────────────────────────────
+  echo "  START  LOW-1"
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info,corro_agent::api::public::files=debug}" \
+    "$binary" --config "$node1/config.toml" agent >"$node1/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  echo "  START  LOW-2"
+  RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info}" \
+    "$binary" --config "$node2/config.toml" agent >"$node2/logs/agent.log" 2>&1 &
+  cleanup_pids+=("$!")
+
+  echo "  UNLOCK unlocking LOW-1 and LOW-2"
+  unlock_node 47051 "$db_key"
+  unlock_node 47052 "$db_key"
+  wait_node 54951; wait_node 54952
+
+  # ── Soak loop ────────────────────────────────────────────────────────────
+  declare -a uploaded_uuids=()
+  declare -A file_contents=()
+  local round
+
+  for (( round = 1; round <= rounds; round++ )); do
+    local tick_start=$SECONDS
+
+    # Generate a unique, deterministic file for this round
+    local uuid
+    uuid="f0000000-$(printf '%04x' $round)-$(printf '%04x' $(( round * 7 )))0-$(printf '%04x' $(( round * 13 )))0-$(printf '%012x' $SECONDS)"
+    local filename="soak_round_${round}_file.bin"
+    local content
+    content="GALVANIZE_SOAK_CONTENT_ROUND${round}_TS$(date +%s%N)"
+    local expected_sha256
+    expected_sha256=$(printf "%s" "$content" | sha256sum | awk '{print $1}')
+
+    echo "  UPLOAD [round $round/$rounds] $filename uuid=$uuid"
+    local upload_resp
+    upload_resp=$(curl -fsS -X POST \
+      "http://127.0.0.1:47051/v1/files/upload?uuid=${uuid}&filename=${filename}" \
+      -H "Content-Type: application/octet-stream" \
+      --data-binary "$content")
+    echo "$upload_resp" | grep -q '"status":"ok"' \
+      || { echo "  ERROR  Upload failed in round $round: $upload_resp" >&2; return 1; }
+    echo "$upload_resp" | grep -q "$expected_sha256" \
+      || { echo "  ERROR  SHA-256 mismatch for round $round upload" >&2; return 1; }
+
+    uploaded_uuids+=("$uuid")
+    file_contents["$uuid"]="$content"
+
+    # ── Verify metadata on LOW-1 via PostgreSQL wire ───────────────────────
+    local count_1
+    count_1=$(psql "postgresql://postgres@127.0.0.1:54951/postgres" -tA -qc \
+      "SELECT count(*) FROM files WHERE uuid = '$uuid';")
+    [[ "$count_1" == "1" ]] \
+      || { echo "  ERROR  files row not present on LOW-1 after round $round upload" >&2; return 1; }
+
+    # ── Wait for metadata gossip to LOW-2 ─────────────────────────────────
+    local deadline=$(( SECONDS + timeout_seconds ))
+    local count_2=0
+    until (( count_2 == 1 || SECONDS >= deadline )); do
+      count_2=$(psql "postgresql://postgres@127.0.0.1:54952/postgres" -tA -qc \
+        "SELECT count(*) FROM files WHERE uuid = '$uuid';" 2>/dev/null || echo 0)
+      sleep 0.3
+    done
+    [[ "$count_2" == "1" ]] \
+      || { echo "  ERROR  files row did not gossip to LOW-2 in round $round" >&2; return 1; }
+    echo "  GOSSIP [round $round] metadata replicated to LOW-2"
+
+    # ── Peer-fetch ALL uploaded files from LOW-2 ─────────────────────────
+    local u fetched errors=0
+    for u in "${uploaded_uuids[@]}"; do
+      fetched=$(curl -fsS "http://127.0.0.1:47052/v1/files/$u" 2>/dev/null || echo "")
+      if [[ "$fetched" != "${file_contents[$u]}" ]]; then
+        echo "  ERROR  peer-fetch mismatch for uuid=$u in round $round" >&2
+        echo "         expected: ${file_contents[$u]}" >&2
+        echo "         got:      $fetched" >&2
+        errors=$(( errors + 1 ))
+      fi
+    done
+    (( errors == 0 )) \
+      || { echo "  ERROR  $errors peer-fetch failures in round $round" >&2; return 1; }
+    echo "  FETCH  [round $round] all ${#uploaded_uuids[@]} file(s) verified bit-identical on LOW-2"
+
+    # ── Search: expect exactly $round results matching "soak_" ───────────
+    local search_resp expected_count=${#uploaded_uuids[@]}
+    search_resp=$(curl -fsS "http://127.0.0.1:47052/v1/files/search?name=soak_" 2>/dev/null || echo "[]")
+    local found_count
+    found_count=$(echo "$search_resp" | grep -o '"uuid"' | wc -l | tr -d ' ')
+    [[ "$found_count" -eq "$expected_count" ]] \
+      || { echo "  ERROR  search returned $found_count results, expected $expected_count in round $round" >&2; return 1; }
+    echo "  SEARCH [round $round] found $found_count / $expected_count soak files on LOW-2 ✓"
+
+    # ── Stats: total_files on each node should equal round number ─────────
+    local stats1 stats2 tf1 tf2
+    stats1=$(curl -fsS "http://127.0.0.1:47051/v1/files/stats" 2>/dev/null || echo '{}')
+    stats2=$(curl -fsS "http://127.0.0.1:47052/v1/files/stats" 2>/dev/null || echo '{}')
+    tf1=$(echo "$stats1" | grep -o '"total_files":[0-9]*' | cut -d: -f2 || echo 0)
+    tf2=$(echo "$stats2" | grep -o '"total_files":[0-9]*' | cut -d: -f2 || echo 0)
+    [[ "$tf1" -eq "$expected_count" && "$tf2" -eq "$expected_count" ]] \
+      || { echo "  ERROR  stats mismatch: LOW-1=$tf1, LOW-2=$tf2, expected=$expected_count" >&2; return 1; }
+    echo "  STATS  [round $round] LOW-1=$tf1 LOW-2=$tf2 total_files ✓"
+
+    # ── Wait until the interval expires before the next round ─────────────
+    if (( round < rounds )); then
+      local elapsed=$(( SECONDS - tick_start ))
+      local sleep_for=$(( files_soak_interval_seconds - elapsed ))
+      if (( sleep_for > 0 )); then
+        echo "  SLEEP  ${sleep_for}s until round $(( round + 1 ))"
+        sleep "$sleep_for"
+      fi
+    fi
+  done
+
+  echo ""
+  echo "  CHECK  All $rounds soak rounds PASSED!"
+  echo "         Total files uploaded: ${#uploaded_uuids[@]}"
+  echo "         Every file peer-fetched bit-identically from LOW-2 each round."
+
+  finish "$runtime" 0
+}
+
 case "$scenario" in
   encryption) encryption ;;
   rekey) rekey ;;
   allow-nodes) allow_nodes ;;
   highlow) highlow ;;
+  files) files ;;
+  files-soak) files_soak ;;
   partition) partition ;;
   crash-recovery) crash_recovery ;;
   crdt-contention) crdt_contention ;;
@@ -2533,6 +3068,6 @@ case "$scenario" in
   large-payload) large_payload ;;
   long-running-five-node) long_running_five_node ;;
   benchmark) benchmark ;;
-  all) encryption; rekey; allow_nodes; highlow; partition; crash_recovery; crdt_contention; views; highlow_faults; highlow_schema; large_payload ;;
-  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|partition|crash-recovery|crdt-contention|views|highlow-faults|highlow-schema|large-payload|long-running-five-node|benchmark|all}" >&2; exit 2 ;;
+  all) encryption; rekey; allow_nodes; highlow; files; partition; crash_recovery; crdt_contention; views; highlow_faults; highlow_schema; large_payload ;;
+  *) echo "usage: $0 {encryption|rekey|allow-nodes|highlow|files|files-soak|partition|crash-recovery|crdt-contention|views|highlow-faults|highlow-schema|large-payload|long-running-five-node|benchmark|all}" >&2; exit 2 ;;
 esac

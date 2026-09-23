@@ -59,6 +59,7 @@ pub struct AgentOptions {
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listeners: Vec<TcpListener>,
+    pub highlow_control_listener: Option<TcpListener>,
     pub rx_bcast: CorroReceiver<BroadcastInput>,
     pub rx_apply: CorroReceiver<ApplyTrigger>,
     pub rx_clear_buf: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
@@ -107,6 +108,14 @@ pub async fn init_database_state(
             // enter ordinary mesh replication.
             galv_highlow::initialize_store(&db_conn)?;
         }
+        db_conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS __galv_files_local (
+                uuid TEXT PRIMARY KEY NOT NULL,
+                status TEXT NOT NULL,
+                downloaded_at TEXT NOT NULL,
+                error TEXT
+            ) WITHOUT ROWID;",
+        )?;
 
         let conn = CrConn::init(db_conn)?;
         conn.query_row("SELECT crsql_site_id();", [], |row| {
@@ -135,6 +144,23 @@ pub async fn init_database_state(
     let schema = {
         let mut conn = pool.write_priority().await?;
         migrate(clock.clone(), &mut conn)?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS files (
+                uuid TEXT PRIMARY KEY NOT NULL,
+                filename TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL DEFAULT '',
+                content_type TEXT,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                metadata JSON
+            );
+            SELECT crsql_as_crr('files');
+            DELETE FROM __corro_schema WHERE tbl_name = 'files';
+            INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'system' AS source FROM sqlite_schema WHERE tbl_name = 'files' AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL;",
+        )?;
+
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
 
@@ -239,7 +265,11 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                 let default_actor_id = ActorId::default();
                 let clock = Arc::new(
                     uhlc::HLCBuilder::default()
-                        .with_id(default_actor_id.try_into().unwrap_or_else(|_| uhlc::ID::rand()))
+                        .with_id(
+                            default_actor_id
+                                .try_into()
+                                .unwrap_or_else(|_| uhlc::ID::rand()),
+                        )
                         .with_max_delta(Duration::from_millis(300))
                         .build(),
                 );
@@ -280,6 +310,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         api_listeners.push(TcpListener::bind(addr).await?);
     }
     let api_addr = api_listeners.first().unwrap().local_addr()?;
+    let highlow_control_listener = match &conf.highlow.control_api {
+        Some(control) if conf.highlow.enabled => Some(TcpListener::bind(control.addr).await?),
+        _ => None,
+    };
 
     let (tx_bcast, rx_bcast) = bounded(conf.perf.bcast_channel_len, "bcast");
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
@@ -295,6 +329,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         gossip_server_endpoint,
         transport: transport.clone(),
         api_listeners,
+        highlow_control_listener,
         rx_bcast,
         rx_apply,
         rx_clear_buf,

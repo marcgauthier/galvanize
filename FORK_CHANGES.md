@@ -34,7 +34,7 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
     - PostgreSQL wire listeners (`corro-pg`), SWIM gossip, QUIC transport, and sync loops are deferred and only launch once unlocked.
     - Supplying invalid keys returns `401 Unauthorized` without crashing the daemon.
     - On valid unlock, the active key is stored in zeroized memory, SQLite pool is created, migrations run, state transitions to `Unlocked`, and background services start.
-- **Offline CLI Command**: `corrosion rekey`
+- **Offline CLI Command**: `galvanize rekey`
   - Interactive hidden prompts for current key, new key, and confirmation.
   - Verifies corrosion daemon is not running before rekeying.
   - Safely rekeys SQLite database using SQLite3MC and verifies data integrity.
@@ -85,7 +85,7 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **Crash Recovery:** 3-node cluster crash-recovery test executing ungraceful `kill -9` mid-transaction bursts, rolling crashes of Nodes B and C, SQLite3MC encrypted WAL recovery, and anti-entropy reconciliation to identical SHA-256 database state across all nodes.
 - **CRDT Contention:** 3-node concurrent mutation test executing parallel disjoint column updates on identical rows, same-column Last-Write-Wins (LWW) contention, and concurrent delete interleaving, validating CR-SQLite conflict-free convergence to identical SHA-256 database state across all nodes.
 - **High/Low Faults:** 3-node air-gap resiliency test verifying deterministic rejection of corrupted payloads (MAC/digest failures) and forged Ed25519 manifest signatures, replay attack idempotency, and out-of-order sequence gap holding and healing across the High cluster mesh.
-- **High/Low Schema Evolution:** 3-node air-gap schema drift test validating safe `waiting-schema` hold on the High receiver when Low evolves schema first, followed by zero-downtime hot schema reload (`corrosion reload`) and automatic backlog ingestion across all mesh peers.
+- **High/Low Schema Evolution:** 3-node air-gap schema drift test validating safe `waiting-schema` hold on the High receiver when Low evolves schema first, followed by zero-downtime hot schema reload (`galvanize reload`) and automatic backlog ingestion across all mesh peers.
 - **Large Payload & Bulk Batches:** 3-node cluster stress test validating 1,000-row atomic bulk batch transactions, multi-megabyte binary blob payloads (1.5 MB), Zstd level-15 compression/decompression, and 8 KiB chunked QUIC stream replication to bit-identical state across all mesh peers.
 - **Two-Node Benchmark:** Manual `tests-live/benchmark` scenario drives fully acknowledged 100-mutation PostgreSQL-wire transactions on one encrypted node for a configurable duration, measures convergence to a SHA-256-identical peer, and reports workload, replication-drain, and total logical protocol byte rates from Prometheus counters.
 
@@ -97,3 +97,45 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **Implementation:**
   - `DbConfig` and `ConfigBuilder` in [`crates/corro-types/src/config.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/config.rs).
   - Applied on all connection pools and dedicated write connections in [`crates/corro-types/src/sqlite.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/sqlite.rs) and [`crates/corro-types/src/agent.rs`](file:///home/marc/GALVANIZE/crates/corro-types/src/agent.rs).
+
+### 10. High/Low Control API
+- **Files:** `crates/corro-types/src/config.rs` and `crates/corro-agent` High/Low integration.
+- **Behavior:** Adds an optional dedicated mTLS HTTPS control listener for Galvanize High/Low status, replay, and provenance operations. TLS material is supplied by named environment variables; High/Low provenance and replay state remain outside CR-SQLite gossip replication.
+
+### 11. File Uploads, Encrypted-at-Rest Storage, and Air-Gap Replication
+- **New Crate:** [`crates/galv-files`](crates/galv-files) providing authenticated symmetric encryption (`XChaCha20-Poly1305`) for file payloads, SHA-256 integrity verification, storage path management, and multi-transport airgap transfers (Directory, HTTPS, FTP/FTPS, SFTP).
+- **Configuration:** Exposed under `[files]` in `config.toml`:
+  - `enabled`: Enables file service routes and capabilities.
+  - `accept-uploads`: Gating for direct client uploads (`POST /v1/files/upload`).
+  - `accept-from-peers`: Gating for servicing peer downloads (`GET /v1/files/{uuid}`).
+  - `push-to-high`: Automatically stages/publishes uploaded files to configured High/Low air-gap transport.
+  - `sync-airgap-files`: Enables background polling worker on High nodes to download missing payloads from airgap transport.
+  - `storage-path`: Storage folder for encrypted file blobs (`<storage-path>/{uuid}.galvf`). Defaults to `<data-dir>/files`.
+  - `max-file-size-bytes`: Maximum file upload size limit in bytes (defaults to 1 GiB).
+  - `airgap-poll-interval-seconds`: Frequency of background air-gap sync scans.
+- **CR-SQLite `files` Table:**
+  - Distributed metadata table initialized on node unlock: `files (uuid TEXT PRIMARY KEY NOT NULL, filename TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, sha256 TEXT NOT NULL DEFAULT '', content_type TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '', metadata JSON)`.
+  - Converted to CRR via `crsql_as_crr('files')` and registered in `__corro_schema` so metadata automatically replicates across all mesh peers in the cluster domain.
+  - Local state tracking via non-CRR `__galv_files_local` table (`uuid`, `status`, `downloaded_at`, `error`).
+- **Cryptographic Key Derivation:**
+  - Files are encrypted at rest using `XChaCha20-Poly1305` AEAD with 24-byte unique random nonces.
+  - The 256-bit encryption key is derived via `HKDF-SHA256` from the active in-memory master unlock key (`galv_rekey_cli::get_active_key()`), preserving zero plaintext secrets on disk.
+- **HTTP REST APIs:**
+  - `POST /v1/files/upload?uuid=<uuid>&filename=<name>&content_type=<mime>`: Upload and encrypt a file payload. Returns JSON metadata.
+  - `GET /v1/files/{uuid}`: Decrypt and stream file payload. If not locally cached, transparently fetches and caches payload from cluster peers.
+  - `GET /v1/files/{uuid}/metadata`: Retrieve file metadata without downloading payload.
+  - `GET /v1/files/search?name=<query>`: Search file records by filename.
+  - `GET /v1/files/stats`: Total file counts, byte sizes, and local cached storage metrics.
+  - `DELETE /v1/files/{uuid}`: Delete file from CR-SQLite database and wipe encrypted payload from disk.
+  - `POST /v1/files/sync`: Trigger immediate on-demand synchronization of missing air-gap payloads.
+  - `GET /v1/files/{uuid}/peer_fetch`: Peer-to-peer payload fetch endpoint.
+- **Live Test Scenario:** `tests-live/files` verifying 4-node cluster (Low-1, Low-2, High-1, High-2) upload, gossip metadata mesh convergence, peer-fetch replication, airgap bundle delivery, background transport payload download, search, stats, and delete cascade.
+
+### 12. Recipient-Encrypted File Air-Gap Artifacts
+- **Upstream integration files:** `crates/corro-agent/src/api/public/files.rs` and `crates/corro-agent/src/agent/files_sync.rs` seal uploaded file bytes for the High RSA recipient before transport and decrypt them on High before re-encrypting with the local file-store key. Unsealed artifacts are rejected.
+- **Galvanize crate:** `crates/galv-files/src/sealed_file.rs` owns the versioned hybrid-encryption format and tests; `tests-live/files` checks staged ciphertext and High-side retrieval.
+
+### 13. Galvanize Executable Name
+- **File:** `crates/corrosion/Cargo.toml`.
+- **Behavior:** The upstream `corrosion` Cargo package now declares a single `galvanize` binary target from `src/main.rs`. The package and internal crate names remain unchanged for upstream compatibility.
+- **Call sites:** README and usage examples, the upstream CLI/deployment docs, the Fly image, live-test runners, and CLI integration tests launch `galvanize`.

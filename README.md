@@ -12,7 +12,7 @@ GALVANIZE is for deployments that need distributed state without giving up contr
 
 ### Encryption at rest
 
-Local SQLite databases can be encrypted with SQLite3 Multiple Ciphers (SQLite3MC). To ensure zero plaintext secrets on the filesystem or environment, database keys are supplied dynamically via HTTP POST JSON to the Remote Unlock API (`POST /v1/admin/unlock`). In addition, the `corrosion rekey` CLI command supports safely rotating an existing database key while the agent is stopped.
+Local SQLite databases can be encrypted with SQLite3 Multiple Ciphers (SQLite3MC). To ensure zero plaintext secrets on the filesystem or environment, database keys are supplied dynamically via HTTP POST JSON to the Remote Unlock API (`POST /v1/admin/unlock`). In addition, the `galvanize rekey` CLI command supports safely rotating an existing database key while the agent is stopped.
 
 ### Cross-domain, unidirectional replication
 
@@ -51,7 +51,7 @@ In a nutshell, GALVANIZE:
 
 Run the GALVANIZE agent on every node or host in the cluster. Applications can access the local GALVANIZE database through its HTTP endpoint or its PostgreSQL wire-protocol endpoint. The PostgreSQL endpoint provides protocol compatibility only: queries must use SQLite SQL syntax. The HTTP API also supports querying and updating the database and subscribing to change notifications.
 
-The `corrosion` CLI provides administration and database access. The executable name remains `corrosion` for compatibility with the upstream project.
+The `galvanize` CLI provides administration and database access. The Cargo package and several internal crate names still use `corrosion` or `corro-*` to make upstream changes easier to integrate, but the executable built by this fork is `galvanize`.
 
 ### Quick start
 
@@ -67,5 +67,6 @@ The upstream [Corrosion documentation](https://superfly.github.io/corrosion/) re
 From within the repository directory:
 
 ```
-cargo build --release && mv target/release/corrosion ./
+cargo build --release -p corrosion --bin galvanize
+./target/release/galvanize --help
 ```

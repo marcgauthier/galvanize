@@ -253,7 +253,9 @@ pub fn insert_local_changes(
 
             if agent.config().highlow.enabled && agent.config().highlow.low.is_some() {
                 if let Err(e) = capture_highlow_events_for_actor(agent, tx, actor_id, db_version) {
-                    tracing::error!("failed to capture highlow events for db_version {db_version}: {e}");
+                    tracing::error!(
+                        "failed to capture highlow events for db_version {db_version}: {e}"
+                    );
                 }
             }
 
@@ -295,7 +297,10 @@ pub fn capture_highlow_events_for_actor(
         })?;
 
     let rows = prepped
-        .query_map(rusqlite::params![db_version, actor_id.as_bytes()], row_to_change)
+        .query_map(
+            rusqlite::params![db_version, actor_id.as_bytes()],
+            row_to_change,
+        )
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
@@ -345,7 +350,7 @@ pub fn capture_highlow_events_for_actor(
 
     let mut stmt = tx
         .prepare_cached(
-            "INSERT INTO __galv_highlow_events (stream_id, sequence, event_json) VALUES (?1, ?2, ?3)",
+            "INSERT INTO __galv_highlow_events (stream_id, sequence, event_json, committed_at_ms) VALUES (?1, ?2, ?3, ?4)",
         )
         .map_err(|source| ChangeError::Rusqlite {
             source,
@@ -395,7 +400,13 @@ pub fn capture_highlow_events_for_actor(
             for (idx, val_ref) in unpacked.into_iter().enumerate() {
                 let col_name = pk_cols
                     .and_then(|cols| cols.get(idx).cloned())
-                    .unwrap_or_else(|| format!("pk_{idx}"));
+                    .unwrap_or_else(|| {
+                        if table == "files" && idx == 0 {
+                            "uuid".to_string()
+                        } else {
+                            format!("pk_{idx}")
+                        }
+                    });
                 let json_val = match val_ref.0 {
                     rusqlite::types::ValueRef::Null => serde_json::Value::Null,
                     rusqlite::types::ValueRef::Integer(i) => serde_json::json!(i),
@@ -437,14 +448,117 @@ pub fn capture_highlow_events_for_actor(
             version: Some(db_version),
         })?;
 
-        stmt.execute(rusqlite::params![event.stream_id, event.sequence, json_bytes])
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: Some(db_version),
-            })?;
+        stmt.execute(rusqlite::params![
+            event.stream_id,
+            event.sequence,
+            json_bytes,
+            event.committed_at_ms
+        ])
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
     }
 
+    Ok(())
+}
+
+/// Marks fields changed locally on High as High-owned, but only for rows that
+/// already have Low provenance. This is kept separate from Low capture so a
+/// received Low bundle can never accidentally claim ownership of itself.
+pub fn capture_highlow_ownership_for_actor(
+    agent: &Agent,
+    tx: &Connection,
+    actor_id: ActorId,
+    db_version: CrsqlDbVersion,
+) -> Result<(), ChangeError> {
+    if !agent.config().highlow.enabled || agent.config().highlow.high.is_none() {
+        return Ok(());
+    }
+    let schema = agent.schema().read();
+    let pk_names: std::collections::HashMap<String, Vec<String>> = schema
+        .tables
+        .iter()
+        .map(|(name, table)| (name.clone(), table.pk.iter().cloned().collect()))
+        .collect();
+    drop(schema);
+    let mut stmt = tx.prepare_cached("SELECT \"table\", pk, cid FROM crsql_changes WHERE db_version=?1 AND site_id=?2 ORDER BY seq").map_err(|source| ChangeError::Rusqlite { source, actor_id:Some(actor_id), version:Some(db_version) })?;
+    let rows = stmt
+        .query_map(rusqlite::params![db_version, actor_id.as_bytes()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
+    let mut groups: indexmap::IndexMap<(String, Vec<u8>), Vec<String>> = indexmap::IndexMap::new();
+    for row in rows {
+        let (table, pk, cid) = row.map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: Some(db_version),
+        })?;
+        if !table.starts_with("__galv_")
+            && !table.starts_with("__corro_")
+            && !table.starts_with("crsql_")
+        {
+            groups.entry((table, pk)).or_default().push(cid);
+        }
+    }
+    for ((table, bytes), columns) in groups {
+        let mut key = serde_json::Map::new();
+        if let Ok(values) = crate::pubsub::unpack_columns(&bytes) {
+            for (index, value) in values.into_iter().enumerate() {
+                let name = pk_names
+                    .get(&table)
+                    .and_then(|v| v.get(index))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if table == "files" && index == 0 {
+                            "uuid".to_string()
+                        } else {
+                            format!("pk_{index}")
+                        }
+                    });
+                let json = match value.0 {
+                    rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                    rusqlite::types::ValueRef::Integer(v) => json!(v),
+                    rusqlite::types::ValueRef::Real(v) => json!(v),
+                    rusqlite::types::ValueRef::Text(v) => {
+                        serde_json::Value::String(String::from_utf8_lossy(v).into_owned())
+                    }
+                    rusqlite::types::ValueRef::Blob(v) => serde_json::Value::String(hex::encode(v)),
+                };
+                key.insert(name, json);
+            }
+        }
+        if key.is_empty() {
+            continue;
+        }
+        if columns.iter().any(|v| v == "-1") {
+            galv_highlow::remove_provenance(tx, &table, &key).map_err(|source| {
+                ChangeError::Rusqlite {
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                    actor_id: Some(actor_id),
+                    version: Some(db_version),
+                }
+            })?;
+        } else {
+            galv_highlow::mark_high_ownership(tx, &table, &key, &columns).map_err(|source| {
+                ChangeError::Rusqlite {
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                    actor_id: Some(actor_id),
+                    version: Some(db_version),
+                }
+            })?;
+        }
+    }
     Ok(())
 }
 

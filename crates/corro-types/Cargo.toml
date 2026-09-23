@@ -67,6 +67,7 @@ lazy_static = { workspace = true }
 zstd = { workspace = true }
 galv-rekey-cli = { path = "../galv-rekey-cli" }
 galv-highlow = { path = "../galv-highlow" }
+galv-files = { path = "../galv-files" }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }

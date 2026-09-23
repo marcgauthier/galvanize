@@ -53,6 +53,7 @@ async fn run(
         gossip_server_endpoint,
         transport,
         api_listeners,
+        highlow_control_listener,
         mut tripwire,
         rx_bcast,
         rx_apply,
@@ -80,6 +81,14 @@ async fn run(
     )
     .await?;
     handles.append(&mut http_handles);
+
+    if let Some(listener) = highlow_control_listener {
+        handles.push(highlow::spawn_control_api(
+            agent.clone(),
+            listener,
+            tripwire.clone(),
+        )?);
+    }
 
     let is_unlocked = agent.is_unlocked();
     if is_unlocked {
@@ -151,11 +160,20 @@ async fn spawn_background_services(
     tripwire: Tripwire,
     rx_bcast: corro_types::channel::CorroReceiver<corro_types::broadcast::BroadcastInput>,
     rx_apply: corro_types::channel::CorroReceiver<corro_types::agent::ApplyTrigger>,
-    rx_clear_buf: corro_types::channel::CorroReceiver<(corro_types::actor::ActorId, corro_types::base::CrsqlDbVersionRange)>,
-    rx_changes: corro_types::channel::CorroReceiver<(corro_types::broadcast::ChangeV1, corro_types::broadcast::ChangeSource, Option<corro_types::broadcast::BroadcastV1>)>,
+    rx_clear_buf: corro_types::channel::CorroReceiver<(
+        corro_types::actor::ActorId,
+        corro_types::base::CrsqlDbVersionRange,
+    )>,
+    rx_changes: corro_types::channel::CorroReceiver<(
+        corro_types::broadcast::ChangeV1,
+        corro_types::broadcast::ChangeSource,
+        Option<corro_types::broadcast::BroadcastV1>,
+    )>,
     rx_foca: corro_types::channel::CorroReceiver<corro_types::broadcast::FocaInput>,
     rx_plumtree: corro_types::channel::CorroReceiver<corro_types::broadcast::PlumtreeInput>,
-    rx_plumtree_updates: corro_types::channel::CorroReceiver<corro_types::broadcast::PlumtreeUpdates>,
+    rx_plumtree_updates: corro_types::channel::CorroReceiver<
+        corro_types::broadcast::PlumtreeUpdates,
+    >,
     rtt_rx: tokio::sync::mpsc::Receiver<(std::net::SocketAddr, std::time::Duration)>,
 ) -> eyre::Result<()> {
     // Get our gossip address and make sure it's valid
@@ -317,10 +335,15 @@ async fn spawn_background_services(
     if agent.config().highlow.enabled {
         if agent.config().highlow.low.is_some() {
             highlow::spawn_highlow_exporter(agent.clone(), tripwire.clone());
+            highlow::resume_highlow_replay(agent.clone());
         }
         if agent.config().highlow.high.is_some() {
             highlow::spawn_highlow_receiver(agent.clone(), tripwire.clone());
         }
+    }
+
+    if agent.config().files.sync_airgap_files {
+        crate::agent::files_sync::spawn_airgap_file_sync(agent.clone(), tripwire.clone());
     }
 
     spawn_counted(

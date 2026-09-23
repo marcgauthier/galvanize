@@ -37,6 +37,7 @@ foca = { version = "0.19.0", features = ["std", "tracing", "bincode-codec", "ser
 futures = "0.3.28"
 futures-util = "0.3.28"
 galv-rekey-cli = { path = "crates/galv-rekey-cli" }
+galv-files = { path = "crates/galv-files" }
 governor = { version = "0.10.0" }
 hex = "0.4.3"
 ed25519-dalek = "2.1"

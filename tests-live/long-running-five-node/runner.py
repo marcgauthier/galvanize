@@ -63,7 +63,7 @@ class Settings:
         return cls(
             root=root,
             test_dir=test_dir,
-            binary=Path(os.environ.get("GALVANIZE_BIN", root / "target/debug/corrosion")),
+            binary=Path(os.environ.get("GALVANIZE_BIN", root / "target/debug/galvanize")),
             runtime=Path(os.environ.get("GALVANIZE_LIVE_RUNTIME", test_dir / "runtime")),
             storage_root=Path(
                 os.environ.get(
@@ -573,7 +573,7 @@ class LongRunningTest:
 
     def preflight(self) -> None:
         if not self.settings.binary.is_file() or not os.access(self.settings.binary, os.X_OK):
-            raise TestFailure("build first: cargo build -p corrosion")
+            raise TestFailure("build first: cargo build -p corrosion --bin galvanize")
         if shutil.which("psql") is None:
             raise TestFailure("psql is required for live tests")
         forbidden = {Path("/").resolve(), self.settings.root.resolve()}

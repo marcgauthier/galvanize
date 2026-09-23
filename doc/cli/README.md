@@ -1,8 +1,8 @@
 # Command-line Interface
 
-Corrosion has a CLI for managing the local Corrosion agent and database. It also provides commands to read from and write to the cluster's database.
+Corrosion has a CLI for managing the local Corrosion agent and database. It also provides commands to read from and write to the cluster's database. In this GALVANIZE fork, use the `galvanize` executable wherever these upstream pages show `corrosion`.
 
-The base command is `corrosion`. Run `corrosion --help` for a list of subcommands.
+The base command in this fork is `galvanize`. Run `galvanize --help` for a list of subcommands.
 
 See the pages for each subcommand:
 

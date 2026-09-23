@@ -22,7 +22,7 @@ As with the `fly ssh console` command, if you run this command from the director
 You don't need a local Corrosion configuration file if you're only using Corrosion to interface with a remote node. You do need to pass an API address to CLI commands. Here's an example using the `query` subcommand.
 
 ```
-$ ./corrosion  query --timer --columns "SELECT * FROM todos" --api-addr "127.0.0.1:8080"
+$ ./galvanize query --timer --columns "SELECT * FROM todos" --api-addr "127.0.0.1:8080"
 id|title|completed_at
 some-id|Write some Corrosion docs!|1234567890
 some-id-2|Show how broadcasts work|1234567890
