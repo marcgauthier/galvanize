@@ -231,6 +231,8 @@ The admin interface is a length-delimited JSON protocol on a Unix socket, not an
 ./target/release/galvanize --config ./config.toml reload
 ```
 
+For remote administration, GALVANIZE can also expose the separate mTLS HTTPS listener configured under `[admin.control-api]`; it accepts all existing admin commands at `POST /v1/admin/commands`. Server certificate, private key, and client CA PEM contents are read from the named environment variables. See [the API configuration reference](doc/config/api.md#remote-admin-control-api).
+
 Prometheus metrics are available on a separate HTTP listener when configured:
 
 ```toml

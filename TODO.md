@@ -1,22 +1,9 @@
 
-Once this USAGE.md is created then you can use it to make sure OVERWATCH is 
-coded to work properly with GALVANIZE.
+Clients SDK:
 
-script must be adjusted to replace corrosion with galvanize for binary:
+Go      done
+Python  implementing
+Rust 
 
-i.e. in README.md
-From within the repository directory:
-
-```
-cargo build --release && mv target/release/corrosion ./
-```
-
-
-
-
-
-
-
-
-
+Clients must be tested
 

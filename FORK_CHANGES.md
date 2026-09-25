@@ -139,3 +139,14 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **File:** `crates/corrosion/Cargo.toml`.
 - **Behavior:** The upstream `corrosion` Cargo package now declares a single `galvanize` binary target from `src/main.rs`. The package and internal crate names remain unchanged for upstream compatibility.
 - **Call sites:** README and usage examples, the upstream CLI/deployment docs, the Fly image, live-test runners, and CLI integration tests launch `galvanize`.
+
+### 14. Quoted Identifier & Case-Insensitive Schema Parsing
+- **File:** `crates/corro-types/src/schema.rs`.
+- **Behavior:**
+  - Unquotes column names in `prepare_table` before evaluating primary key membership against the unquoted PK set, preventing false positive `NotNullableColumnNeedsDefault` errors on quoted primary key columns.
+  - Adds case-insensitive table lookup fallback when attaching indexes to parsed tables, ensuring quoted/unquoted mixed-case table identifiers in `CREATE INDEX` match their corresponding `CREATE TABLE` definitions.
+
+### 15. Go Client and mTLS Admin Control API
+- **Files:** `Cargo.toml`, `crates/corro-admin/Cargo.toml`, `crates/corro-types/src/config.rs`, `crates/corro-admin/src/lib.rs`, `crates/corrosion/src/command/agent.rs`, and `crates/corrosion/src/command/reload.rs`.
+- **Behavior:** Adds an optional dedicated mTLS HTTPS listener for forwarding remote admin commands through the existing Unix-socket protocol. The listener requires server cert/key and client CA PEM values supplied by named environment variables.
+- **Client:** `clients/go` adds the `database/sql` PostgreSQL-wire client and Go APIs for public HTTP, High/Low mTLS, and remote admin operations.

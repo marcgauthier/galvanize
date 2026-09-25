@@ -38,7 +38,7 @@ pub fn load_information_schema_triggers(
         let (timing, event, body) = parse_trigger_sql(&sql);
         triggers.push(InformationSchemaTrigger {
             trigger_name: name,
-            event_object_schema: "main".into(),
+            event_object_schema: "public".into(),
             event_object_table: tbl_name,
             event_manipulation: event,
             action_timing: timing,
@@ -204,11 +204,11 @@ unsafe impl VTabCursor for InformationSchemaTriggersCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(trigger) = self.triggers.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&"state"), // trigger_catalog
-                1 => ctx.set_result(&"main"),  // trigger_schema
+                0 => ctx.set_result(&"galvanize"), // trigger_catalog
+                1 => ctx.set_result(&"public"),    // trigger_schema
                 2 => ctx.set_result(&trigger.trigger_name),
                 3 => ctx.set_result(&trigger.event_manipulation),
-                4 => ctx.set_result(&"state"), // event_object_catalog
+                4 => ctx.set_result(&"galvanize"), // event_object_catalog
                 5 => ctx.set_result(&trigger.event_object_schema),
                 6 => ctx.set_result(&trigger.event_object_table),
                 7 => ctx.set_result(&0i64), // action_ordering

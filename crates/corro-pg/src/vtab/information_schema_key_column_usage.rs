@@ -114,8 +114,8 @@ unsafe impl VTabCursor for InformationSchemaKeyColumnUsageCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(entry) = self.entries.get(self.row_id as usize) {
             match col {
-                0 | 3 => ctx.set_result(&"state"),
-                1 | 4 => ctx.set_result(&"main"),
+                0 | 3 => ctx.set_result(&"galvanize"),
+                1 | 4 => ctx.set_result(&"public"),
                 2 => ctx.set_result(&entry.constraint_name),
                 5 => ctx.set_result(&entry.table_name),
                 6 => ctx.set_result(&entry.column_name),

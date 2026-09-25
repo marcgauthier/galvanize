@@ -72,6 +72,7 @@ pub async fn run(
         AdminConfig {
             listen_path: config.admin.uds_path.clone(),
             config_path: config_path.clone(),
+            control_api: config.admin.control_api.clone(),
         },
         tracing_handle,
         tripwire,

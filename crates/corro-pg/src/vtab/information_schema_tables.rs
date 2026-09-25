@@ -102,8 +102,8 @@ unsafe impl VTabCursor for InformationSchemaTablesCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(table_name) = self.table_names.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&"state"),
-                1 => ctx.set_result(&"main"),
+                0 => ctx.set_result(&"galvanize"),
+                1 => ctx.set_result(&"public"),
                 2 => ctx.set_result(table_name),
                 3 => ctx.set_result(&"BASE TABLE"),
                 4..=8 | 11 => ctx.set_result(&Option::<String>::None),

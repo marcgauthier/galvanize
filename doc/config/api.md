@@ -88,3 +88,22 @@ verify_client = false                    # optional, set true to require client 
 ```
 
 When `verify_client = true`, only clients presenting a certificate signed by `ca_file` will be accepted (mutual TLS).
+
+## Remote admin control API
+
+The local admin Unix socket remains available. To permit remote operator commands, optionally configure a separate mTLS HTTPS listener. The listener forwards commands through the existing admin socket and supports all of its commands, including schema reload from the node's configured schema paths.
+
+```toml
+[admin]
+uds-path = "/run/galvanize/admin.sock"
+
+[admin.control-api]
+addr = "127.0.0.1:8444"
+server-cert-env = "GALV_ADMIN_SERVER_CERT"
+server-key-env = "GALV_ADMIN_SERVER_KEY"
+client-ca-cert-env = "GALV_ADMIN_CLIENT_CA"
+```
+
+Each environment variable contains PEM material. `POST /v1/admin/commands` accepts one JSON command in the same externally tagged form as the admin socket protocol, such as `"Ping"`, `"Reload"`, or `{"Cluster":"Members"}`. It returns `{ "responses": [...] }` with the command's ordered log, JSON, success, or error events. Admin command errors are included as response events; HTTP 502 indicates the local admin socket could not process the request.
+
+The endpoint is powerful: its client certificate grants the ability to run every admin-socket command, including cluster identity changes and buffered-change processing. Protect the client key and restrict network access to the listener.

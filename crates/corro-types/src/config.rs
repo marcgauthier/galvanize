@@ -446,12 +446,39 @@ pub enum OtelConfig {
 pub struct AdminConfig {
     #[serde(alias = "path")]
     pub uds_path: Utf8PathBuf,
+    /// Optional remote operator API. Private TLS material stays in environment variables.
+    #[serde(default)]
+    pub control_api: Option<AdminControlApiConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AdminControlApiConfig {
+    pub addr: SocketAddr,
+    pub server_cert_env: String,
+    pub server_key_env: String,
+    pub client_ca_cert_env: String,
+}
+
+impl AdminControlApiConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.server_cert_env.is_empty()
+            || self.server_key_env.is_empty()
+            || self.client_ca_cert_env.is_empty()
+        {
+            return Err(ConfigError::AdminControlApi(
+                "control-api TLS environment variable names must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             uds_path: default_admin_path(),
+            control_api: None,
         }
     }
 }
@@ -1052,6 +1079,8 @@ pub enum ConfigError {
     ClientBinds(#[from] ClientBindsError),
     #[error("invalid highlow configuration: {0}")]
     HighLow(String),
+    #[error("invalid admin control API configuration: {0}")]
+    AdminControlApi(String),
 }
 
 impl Config {
@@ -1100,6 +1129,9 @@ impl Config {
         }
         self.gossip.client_binds()?;
         self.highlow.validate()?;
+        if let Some(control_api) = &self.admin.control_api {
+            control_api.validate()?;
+        }
         Ok(())
     }
 }
@@ -1334,6 +1366,7 @@ impl ConfigBuilder {
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
                 uds_path: self.admin_path.unwrap_or_else(default_admin_path),
+                control_api: None,
             },
             telemetry,
             log: self.log.unwrap_or_default(),

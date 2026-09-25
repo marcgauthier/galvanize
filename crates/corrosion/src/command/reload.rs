@@ -63,6 +63,7 @@ mod tests {
             AdminConfig {
                 listen_path: ta.agent.config().admin.uds_path.clone(),
                 config_path: ta.agent.config().db.path.clone(),
+                control_api: ta.agent.config().admin.control_api.clone(),
             },
             None,
             tripwire.clone(),

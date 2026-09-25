@@ -1,9 +1,12 @@
 use std::{
     collections::HashMap,
     fmt::Display,
+    net::TcpListener as StdTcpListener,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use camino::Utf8PathBuf;
 use corro_agent::agent::{
     reload_change_dicts,
@@ -15,6 +18,7 @@ use corro_types::{
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{FocaCmd, FocaInput, PlumtreeInput},
     config::BroadcastMethod,
+    config::AdminControlApiConfig,
     sqlite::SqlitePoolError,
     sync::generate_sync,
     updates::Handle,
@@ -26,17 +30,24 @@ use serde_json::json;
 use spawn::spawn_counted;
 use time::OffsetDateTime;
 use tokio::{
-    net::{UnixListener, UnixStream},
+    net::{TcpListener, UnixListener, UnixStream},
     sync::{mpsc, oneshot},
     task::block_in_place,
 };
-use tokio_serde::{formats::Json, Framed};
+use tokio_serde::{formats::Json as JsonCodec, Framed};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
 use tracing_filter::{legacy::Filter, FilterLayer};
 use tracing_subscriber::{reload::Handle as ReloadHandle, Registry};
 use tripwire::Tripwire;
 use uuid::Uuid;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::{
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
+    RootCertStore, ServerConfig,
+};
+use tokio_rustls::TlsAcceptor;
+use tower::Service;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
@@ -50,6 +61,7 @@ pub enum AdminError {
 pub struct AdminConfig {
     pub listen_path: Utf8PathBuf,
     pub config_path: Utf8PathBuf,
+    pub control_api: Option<AdminControlApiConfig>,
 }
 
 pub type TracingHandle = ReloadHandle<FilterLayer<Filter>, Registry>;
@@ -69,6 +81,13 @@ pub fn start_server(
     }
 
     let ln = UnixListener::bind(&config.listen_path)?;
+    if let Some(control) = &config.control_api {
+        let listener = StdTcpListener::bind(control.addr)?;
+        listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(listener)?;
+        let tls = Arc::new(admin_control_tls_config(control)?);
+        spawn_admin_control_api(listener, tls, config.listen_path.clone(), tripwire.clone());
+    }
 
     spawn_counted(async move {
         loop {
@@ -105,6 +124,122 @@ pub fn start_server(
     });
 
     Ok(())
+}
+
+#[derive(Clone)]
+struct AdminControlState {
+    socket_path: Utf8PathBuf,
+}
+
+fn admin_control_tls_config(control: &AdminControlApiConfig) -> eyre::Result<ServerConfig> {
+    let read_env = |name: &str| {
+        std::env::var(name)
+            .map_err(|_| eyre::eyre!("required admin TLS environment variable {name} is unset"))
+    };
+    let cert_pem = read_env(&control.server_cert_env)?;
+    let key_pem = read_env(&control.server_key_env)?;
+    let ca_pem = read_env(&control.client_ca_cert_env)?;
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<_, _>>()?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        roots.add(cert?)?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+    Ok(ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?)
+}
+
+fn spawn_admin_control_api(
+    listener: TcpListener,
+    tls_config: Arc<ServerConfig>,
+    socket_path: Utf8PathBuf,
+    mut tripwire: Tripwire,
+) {
+    let acceptor = TlsAcceptor::from(tls_config);
+    let app = Router::new()
+        .route("/v1/admin/commands", post(admin_control_command))
+        .with_state(AdminControlState { socket_path });
+    spawn_counted(async move {
+        let addr = listener.local_addr().ok();
+        info!(?addr, "starting admin mTLS control API");
+        loop {
+            let (stream, _) = tokio::select! {
+                result = listener.accept() => match result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(%error, "admin control listener failed");
+                        break;
+                    }
+                },
+                _ = &mut tripwire => break,
+            };
+            let acceptor = acceptor.clone();
+            let app = app.clone();
+            tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(stream).await else { return; };
+                let service = hyper::service::service_fn(move |request| app.clone().call(request));
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .http1_only()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+}
+
+async fn admin_control_command(
+    State(state): State<AdminControlState>,
+    Json(command): Json<Command>,
+) -> axum::response::Response {
+    match send_admin_control_command(&state.socket_path, command).await {
+        Ok(responses) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"responses": responses})),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn send_admin_control_command(
+    socket_path: &Utf8PathBuf,
+    command: Command,
+) -> Result<Vec<Response>, String> {
+    let socket = UnixStream::connect(socket_path)
+        .await
+        .map_err(|error| format!("could not connect to local admin socket: {error}"))?;
+    let framed = tokio_util::codec::Framed::new(
+        socket,
+        LengthDelimitedCodec::builder()
+            .max_frame_length(100 * 1_024 * 1_024)
+            .new_codec(),
+    );
+    let mut stream: AdminControlStream = Framed::new(framed, JsonCodec::default());
+    stream
+        .send(command)
+        .await
+        .map_err(|error| format!("could not send admin command: {error}"))?;
+
+    let mut responses = Vec::new();
+    loop {
+        let response = stream
+            .try_next()
+            .await
+            .map_err(|error| format!("could not read admin response: {error}"))?
+            .ok_or_else(|| "admin socket closed before returning a result".to_string())?;
+        let finished = matches!(&response, Response::Success | Response::Error { .. });
+        responses.push(response);
+        if finished {
+            return Ok(responses);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,7 +343,14 @@ type FramedStream = Framed<
     tokio_util::codec::Framed<UnixStream, LengthDelimitedCodec>,
     Command,
     Response,
-    Json<Command, Response>,
+    JsonCodec<Command, Response>,
+>;
+
+type AdminControlStream = Framed<
+    tokio_util::codec::Framed<UnixStream, LengthDelimitedCodec>,
+    Response,
+    Command,
+    JsonCodec<Response, Command>,
 >;
 
 async fn handle_conn(
@@ -226,7 +368,7 @@ async fn handle_conn(
                 .max_frame_length(100 * 1_024 * 1_024)
                 .new_codec(),
         ),
-        Json::<Command, Response>::default(),
+        JsonCodec::<Command, Response>::default(),
     );
 
     loop {
@@ -966,4 +1108,44 @@ fn check_bookie_consistency(
         only_in_memory_actors,
         only_in_db_actors,
     })
+}
+
+#[cfg(test)]
+mod admin_control_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_command_forwarding_preserves_socket_responses() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.sock");
+        let socket_path = Utf8PathBuf::from_path_buf(path.clone()).unwrap();
+        let listener = UnixListener::bind(path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let framed = tokio_util::codec::Framed::new(
+                socket,
+                LengthDelimitedCodec::builder()
+                    .max_frame_length(1024)
+                    .new_codec(),
+            );
+            let mut stream: FramedStream = Framed::new(framed, JsonCodec::default());
+            assert!(matches!(stream.try_next().await.unwrap(), Some(Command::Ping)));
+            stream
+                .send(Response::Log {
+                    level: LogLevel::Info,
+                    msg: "pong".into(),
+                    ts: OffsetDateTime::now_utc(),
+                })
+                .await
+                .unwrap();
+            stream.send(Response::Success).await.unwrap();
+        });
+
+        let result = send_admin_control_command(&socket_path, Command::Ping)
+            .await
+            .unwrap();
+        assert!(matches!(result.as_slice(), [Response::Log { .. }, Response::Success]));
+        server.await.unwrap();
+    }
 }

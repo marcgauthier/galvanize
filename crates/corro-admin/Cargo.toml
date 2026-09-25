@@ -7,24 +7,33 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
+axum = { workspace = true }
 camino = { workspace = true }
 corro-types = { path = "../corro-types" }
 corro-agent = { path = "../corro-agent" }
 eyre = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 futures = { workspace = true }
 rusqlite = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spawn = { path = "../spawn" }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-serde = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-filter = { workspace = true }
+tower = { workspace = true }
 tripwire = { path = "../tripwire" }
 rangemap = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

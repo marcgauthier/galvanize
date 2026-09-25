@@ -19,6 +19,11 @@ It adds encryption at rest (SQLite3MC) and cross-domain (high/low) air-gap repli
 - **Zero Plaintext Secrets:** Passwords and cryptographic keys (`GALVANIZE_DB_KEY`, RSA PEMs, Ed25519 keys) must always be supplied via named environment variables, never hardcoded in configuration files or CLI flags.
 - **Air-Gap Schema Boundary:** Galvanize does not replicate DDL across air-gaps. High receivers verify `schema_hash` in incoming manifests and hold mismatched bundles in `waiting-schema` until the High cluster schema is aligned.
 
+## Maintain Clients 
+
+make sure to maintain the go-client or other if there exists in the ./clients folder when new features are added in GALVANIZE they must be added in the clients.
+
+
 ## Testing Guidelines
 
 - Add tests that cover new or changed code. Test coverage is a core requirement,

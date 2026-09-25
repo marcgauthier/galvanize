@@ -120,6 +120,36 @@ use crate::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+pub fn parse_sqlite_timestamp(s: &str) -> Option<NaiveDateTime> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = trimmed.parse::<NaiveDateTime>() {
+        return Some(dt);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.naive_utc());
+    }
+    for fmt in &[
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S%#z",
+        "%Y-%m-%d",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(dt);
+        }
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0);
+    }
+    None
+}
+
 pub struct PgServer {
     pub local_addr: SocketAddr,
 }
@@ -1950,7 +1980,8 @@ pub async fn start(
                         });
 
                         conn.execute_batch(
-                            "ATTACH ':memory:' AS pg_catalog;
+                            "PRAGMA busy_timeout = 30000;
+                             ATTACH ':memory:' AS pg_catalog;
                              ATTACH ':memory:' AS information_schema;",
                         )?;
 
@@ -2208,6 +2239,20 @@ pub async fn start(
                             0,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                             |_ctx| Ok("PostgreSQL 14.9"),
+                        )?;
+
+                        conn.create_scalar_function(
+                            "current_schema",
+                            0,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok("public"),
+                        )?;
+
+                        conn.create_scalar_function(
+                            "current_database",
+                            0,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok("galvanize"),
                         )?;
 
                         conn.create_scalar_function(
@@ -2883,38 +2928,22 @@ pub async fn start(
                                                     .map(|param| {
                                                         trace!("got param: {param:?}");
                                                         match (param.sqlite_type, param.source) {
-                                                            (SqliteType::Null, Some("TEXT[]")) => Type::TEXT_ARRAY,
-                                                            (SqliteType::Null, Some("INT[]")) => Type::INT8_ARRAY,
-                                                            (SqliteType::Null, Some("REAL[]")) => Type::FLOAT8_ARRAY,
-                                                            (SqliteType::Null, Some("BLOB[]")) => Type::BYTEA_ARRAY,
-                                                            (SqliteType::Null, Some("BOOL[]")) => Type::BOOL_ARRAY,
-                                                            (SqliteType::Null, _) => unreachable!(),
-                                                            (SqliteType::Text, src) => match src {
-                                                                Some("JSON") => Type::JSON,
-                                                                _ => Type::TEXT,
-                                                            },
-                                                            (SqliteType::Numeric, Some(src)) => {
-                                                                match src {
-                                                                    "BOOLEAN" | "BOOL" => {
-                                                                        Type::BOOL
-                                                                    }
-                                                                    "DATETIME" => Type::TIMESTAMP,
-                                                                    _ => Type::FLOAT8,
-                                                                }
-                                                            }
-                                                            (SqliteType::Numeric, None) => {
-                                                                Type::FLOAT8
-                                                            }
-                                                            (SqliteType::Integer, _src) => {
-                                                                Type::INT8
-                                                            }
-                                                            (SqliteType::Real, _src) => {
-                                                                Type::FLOAT8
-                                                            }
-                                                            (SqliteType::Blob, src) => match src {
-                                                                Some("JSONB") => Type::JSONB,
-                                                                _ => Type::BYTEA,
-                                                            },
+                                                            (SqliteType::Null, Some(src)) if src.eq_ignore_ascii_case("TEXT[]") => Type::TEXT_ARRAY,
+                                                            (SqliteType::Null, Some(src)) if src.eq_ignore_ascii_case("INT[]") => Type::INT8_ARRAY,
+                                                            (SqliteType::Null, Some(src)) if src.eq_ignore_ascii_case("REAL[]") => Type::FLOAT8_ARRAY,
+                                                            (SqliteType::Null, Some(src)) if src.eq_ignore_ascii_case("BLOB[]") => Type::BYTEA_ARRAY,
+                                                            (SqliteType::Null, Some(src)) if src.eq_ignore_ascii_case("BOOL[]") => Type::BOOL_ARRAY,
+                                                            (SqliteType::Null, _) => Type::ANY,
+                                                            (SqliteType::Text, Some(src)) if src.eq_ignore_ascii_case("JSON") => Type::JSON,
+                                                            (SqliteType::Text, Some(src)) if src.eq_ignore_ascii_case("DATETIME") || src.eq_ignore_ascii_case("TIMESTAMP") || src.eq_ignore_ascii_case("DATE") => Type::TIMESTAMP,
+                                                            (SqliteType::Text, _) => Type::TEXT,
+                                                            (SqliteType::Numeric, Some(src)) if src.eq_ignore_ascii_case("BOOLEAN") || src.eq_ignore_ascii_case("BOOL") || src.eq_ignore_ascii_case("NUMERIC") || src.eq_ignore_ascii_case("DECIMAL") => Type::BOOL,
+                                                            (SqliteType::Numeric, Some(src)) if src.eq_ignore_ascii_case("DATETIME") || src.eq_ignore_ascii_case("TIMESTAMP") || src.eq_ignore_ascii_case("DATE") => Type::TIMESTAMP,
+                                                            (SqliteType::Numeric, _) => Type::FLOAT8,
+                                                            (SqliteType::Integer, _) => Type::INT8,
+                                                            (SqliteType::Real, _) => Type::FLOAT8,
+                                                            (SqliteType::Blob, Some(src)) if src.eq_ignore_ascii_case("JSONB") => Type::JSONB,
+                                                            (SqliteType::Blob, _) => Type::BYTEA,
                                                         }
                                                     })
                                                     .collect()
@@ -2928,6 +2957,10 @@ pub async fn start(
                                                         continue;
                                                     }
                                                 };
+                                            }
+
+                                            while param_types.len() < prepped.parameter_count() {
+                                                param_types.push(Type::ANY);
                                             }
 
                                             let fields = match field_types(
@@ -3281,31 +3314,10 @@ pub async fn start(
 
                                                 trace!("got param bytes: {b:?}");
 
-                                                match param_types.get(i) {
-                                                    None => {
-                                                        trace!("no param type found!");
-                                                        back_tx.blocking_send(
-                                                            (
-                                                                PgWireBackendMessage::ErrorResponse(
-                                                                    ErrorInfo::new(
-                                                                        "ERROR".to_owned(),
-                                                                        "XX000".to_owned(),
-                                                                        "missing parameter type"
-                                                                            .into(),
-                                                                    )
-                                                                    .into(),
-                                                                ),
-                                                                true,
-                                                            )
-                                                                .into(),
-                                                        )?;
-                                                        discard_until_sync = true;
-                                                        continue 'outer;
-                                                    }
-                                                    Some(param_type) => {
-                                                        let format_code = format_codes[i];
-                                                        trace!("parsing param_type {param_type:?}, format_code: {format_code:?}, bytes: {b:?}");
-                                                        match param_type {
+                                                let param_type = param_types.get(i).unwrap_or(&Type::ANY);
+                                                let format_code = format_codes.get(i).copied().unwrap_or(FormatCode::Text);
+                                                trace!("parsing param_type {param_type:?}, format_code: {format_code:?}, bytes: {b:?}");
+                                                match param_type {
                                                             t @ &Type::BOOL => {
                                                                 let value: bool =
                                                                     from_type_and_format(
@@ -3416,20 +3428,21 @@ pub async fn start(
 
                                                             t @ &Type::TIMESTAMP => {
                                                                 let dt = match format_code {
-                                                                FormatCode::Text => {
-                                                                    let s =
-                                                                        String::from_utf8_lossy(b);
-                                                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f").map_err(ToParamError::Parse)?
-                                                                }
-                                                                FormatCode::Binary => {
-                                                                    NaiveDateTime::from_sql(t, b)
-                                                                        .map_err(
-                                                                            ToParamError::<
-                                                                                chrono::format::ParseError
-                                                                            >::FromSql,
-                                                                        )?
-                                                                }
-                                                            };
+                                                                    FormatCode::Text => {
+                                                                        let s = String::from_utf8_lossy(b);
+                                                                        parse_sqlite_timestamp(&s).unwrap_or_else(|| {
+                                                                            chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap()
+                                                                        })
+                                                                    }
+                                                                    FormatCode::Binary => {
+                                                                        NaiveDateTime::from_sql(t, b)
+                                                                            .map_err(
+                                                                                ToParamError::<
+                                                                                    chrono::format::ParseError
+                                                                                >::FromSql,
+                                                                            )?
+                                                                    }
+                                                                };
                                                                 prepped
                                                                     .raw_bind_parameter(idx, dt)?;
                                                             }
@@ -3493,30 +3506,19 @@ pub async fn start(
                                                                     idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
                                                                 )?;
                                                             }
-                                                        t => {
-                                                            warn!("unsupported type: {t:?}");
-                                                            back_tx.blocking_send(
-                                                                (
-                                                                    PgWireBackendMessage::ErrorResponse(
-                                                                        ErrorInfo::new(
-                                                                            "ERROR".to_owned(),
-                                                                            "XX000".to_owned(),
-                                                                            format!(
-                                                                            "unsupported type {t} at index {i}"
-                                                                        ),
-                                                                        )
-                                                                        .into(),
-                                                                    ),
-                                                                    true,
-                                                                ).into(),
-                                                            )?;
-                                                                discard_until_sync = true;
-                                                                continue 'outer;
+                                                        _other => {
+                                                            match format_code {
+                                                                FormatCode::Text => {
+                                                                    let s = String::from_utf8_lossy(b);
+                                                                    prepped.raw_bind_parameter(idx, s.as_ref())?;
+                                                                }
+                                                                FormatCode::Binary => {
+                                                                    prepped.raw_bind_parameter(idx, b.as_ref())?;
+                                                                }
                                                             }
                                                         }
                                                     }
                                                 }
-                                            }
 
                                             debug!("EXPANDED SQL: {:?}", prepped.expanded_sql());
 
@@ -4013,7 +4015,7 @@ impl<'conn> Session<'conn> {
 
         // need to start an implicit transaction
         if self.tx_state.is_ended() && !cmd.is_begin() {
-            self.conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
             trace!("started IMPLICIT tx");
             self.tx_state.start_implicit();
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
@@ -4027,7 +4029,7 @@ impl<'conn> Session<'conn> {
         let mut changes = 0usize;
 
         let count = if cmd.is_begin() {
-            self.conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
@@ -4158,13 +4160,13 @@ impl<'conn> Session<'conn> {
             if !cmd.is_begin() && !prepped.readonly() {
                 debug!("tx is_ended && !cmd.is_begin() && !prepped.readonly()");
                 // NOT in a tx and statement mutates DB...
-                self.conn.execute_batch("BEGIN")?;
+                self.conn.execute_batch("BEGIN IMMEDIATE")?;
 
                 self.tx_state.start_implicit();
                 opened_implicit_tx = true;
             } else if cmd.is_begin() {
                 debug!("cmd is BEGIN");
-                self.conn.execute_batch("BEGIN")?;
+                self.conn.execute_batch("BEGIN IMMEDIATE")?;
                 self.tx_state.start_explicit();
                 debug!("started EXPLICIT tx");
             }
@@ -4226,10 +4228,229 @@ impl<'conn> Session<'conn> {
                     trace!("processing field: {field:?}");
                     let format = field.format();
                     let format_opts = field.format_options().as_ref();
-                    match field.datatype() {
-                        &Type::ANY => {
-                            let data = row.get_ref_unwrap(idx);
-                            match data {
+                    let val_ref = row.get_ref_unwrap(idx);
+                    match (field.datatype(), val_ref) {
+                        (_, ValueRef::Null) => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &None::<i8>,
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::BOOL, ValueRef::Integer(i)) => {
+                            let b = i != 0;
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(b),
+                                    &Type::BOOL,
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::BOOL, ValueRef::Real(f)) => {
+                            let b = f != 0.0;
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(b),
+                                    &Type::BOOL,
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::BOOL, ValueRef::Text(t)) => {
+                            let s = String::from_utf8_lossy(t);
+                            let b = s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("t");
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(b),
+                                    &Type::BOOL,
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::BOOL, ValueRef::Blob(b)) => {
+                            let is_true = !b.is_empty() && b[0] != 0;
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(is_true),
+                                    &Type::BOOL,
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::INT8 | &Type::INT4 | &Type::INT2, ValueRef::Integer(i)) => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(i),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::INT8 | &Type::INT4 | &Type::INT2, ValueRef::Real(f)) => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(f as i64),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::INT8 | &Type::INT4 | &Type::INT2, ValueRef::Text(t)) => {
+                            let s = String::from_utf8_lossy(t);
+                            let i = s.parse::<i64>().unwrap_or(0);
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(i),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::FLOAT8 | &Type::FLOAT4, ValueRef::Real(f)) => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(f),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::FLOAT8 | &Type::FLOAT4, ValueRef::Integer(i)) => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(i as f64),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::FLOAT8 | &Type::FLOAT4, ValueRef::Text(t)) => {
+                            let s = String::from_utf8_lossy(t);
+                            let f = s.parse::<f64>().unwrap_or(0.0);
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(f),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::TIMESTAMP | &Type::TIMESTAMPTZ, ValueRef::Text(t)) => {
+                            let s = String::from_utf8_lossy(t);
+                            let dt = parse_sqlite_timestamp(&s);
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &dt,
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::TIMESTAMP | &Type::TIMESTAMPTZ, ValueRef::Integer(i)) => {
+                            let dt = chrono::DateTime::from_timestamp(i, 0).map(|dt| dt.naive_utc());
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &dt,
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::TIMESTAMP | &Type::TIMESTAMPTZ, ValueRef::Real(f)) => {
+                            let secs = f.floor() as i64;
+                            let nsecs = ((f - (secs as f64)) * 1_000_000_000.0) as u32;
+                            let dt = chrono::DateTime::from_timestamp(secs, nsecs).map(|dt| dt.naive_utc());
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &dt,
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::VARCHAR | &Type::TEXT | &Type::JSON | &Type::BPCHAR, ValueRef::Text(t)) => {
+                            let s = String::from_utf8_lossy(t);
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(s.as_ref()),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::VARCHAR | &Type::TEXT | &Type::JSON | &Type::BPCHAR, ValueRef::Integer(i)) => {
+                            let s = i.to_string();
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(s.as_str()),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::VARCHAR | &Type::TEXT | &Type::JSON | &Type::BPCHAR, ValueRef::Real(f)) => {
+                            let s = f.to_string();
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(s.as_str()),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::VARCHAR | &Type::TEXT | &Type::JSON | &Type::BPCHAR, ValueRef::Blob(b)) => {
+                            let s = String::from_utf8_lossy(b);
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(s.as_ref()),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::BYTEA | &Type::JSONB, ValueRef::Blob(b)) => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(b),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (&Type::BYTEA | &Type::JSONB, ValueRef::Text(t)) => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &Some(t),
+                                    field.datatype(),
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
+                        (_, val) => {
+                            match val {
                                 ValueRef::Null => encoder
                                     .encode_field_with_type_and_format(
                                         &None::<i8>,
@@ -4238,112 +4459,39 @@ impl<'conn> Session<'conn> {
                                         format_opts,
                                     )
                                     .unwrap(),
-                                ValueRef::Integer(i) => {
-                                    encoder
-                                        .encode_field_with_type_and_format(
-                                            &i,
-                                            &Type::INT8,
-                                            format,
-                                            format_opts,
-                                        )
-                                        .unwrap();
-                                }
-                                ValueRef::Real(f) => {
-                                    encoder
-                                        .encode_field_with_type_and_format(
-                                            &f,
-                                            &Type::FLOAT8,
-                                            format,
-                                            format_opts,
-                                        )
-                                        .unwrap();
-                                }
-                                ValueRef::Text(t) => {
-                                    encoder
-                                        .encode_field_with_type_and_format(
-                                            &String::from_utf8_lossy(t).as_ref(),
-                                            &Type::TEXT,
-                                            format,
-                                            format_opts,
-                                        )
-                                        .unwrap();
-                                }
-                                ValueRef::Blob(b) => {
-                                    encoder
-                                        .encode_field_with_type_and_format(
-                                            &b,
-                                            &Type::BYTEA,
-                                            format,
-                                            format_opts,
-                                        )
-                                        .unwrap();
-                                }
+                                ValueRef::Integer(i) => encoder
+                                    .encode_field_with_type_and_format(
+                                        &i,
+                                        &Type::INT8,
+                                        format,
+                                        format_opts,
+                                    )
+                                    .unwrap(),
+                                ValueRef::Real(f) => encoder
+                                    .encode_field_with_type_and_format(
+                                        &f,
+                                        &Type::FLOAT8,
+                                        format,
+                                        format_opts,
+                                    )
+                                    .unwrap(),
+                                ValueRef::Text(t) => encoder
+                                    .encode_field_with_type_and_format(
+                                        &String::from_utf8_lossy(t).as_ref(),
+                                        &Type::TEXT,
+                                        format,
+                                        format_opts,
+                                    )
+                                    .unwrap(),
+                                ValueRef::Blob(b) => encoder
+                                    .encode_field_with_type_and_format(
+                                        &b,
+                                        &Type::BYTEA,
+                                        format,
+                                        format_opts,
+                                    )
+                                    .unwrap(),
                             }
-                        }
-                        t @ &Type::BOOL => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<bool>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
-                        }
-                        t @ &Type::INT8 => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<i64>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
-                        }
-                        t @ &Type::TIMESTAMP => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<NaiveDateTime>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
-                        }
-                        t @ &Type::VARCHAR | t @ &Type::TEXT | t @ &Type::JSON => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<String>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
-                        }
-                        t @ &Type::BYTEA | t @ &Type::JSONB => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<Vec<u8>>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
-                        }
-                        t @ &Type::FLOAT8 => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<f64>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
-                        }
-                        _ => {
-                            return Err(
-                                UnsupportedSqliteToPostgresType(field.name().to_owned()).into()
-                            )
                         }
                     }
                 }
@@ -4718,8 +4866,7 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
         "JSONB" => Type::JSONB,
         "JSON" => Type::JSON,
         "FLOAT" | "REAL" | "DOUBLE" | "DOUBLE PRECISION" => Type::FLOAT8,
-        "BOOL" | "BOOLEAN" => Type::BOOL,
-        "NUMERIC" | "DECIMAL" => Type::NUMERIC,
+        "BOOL" | "BOOLEAN" | "NUMERIC" | "DECIMAL" => Type::BOOL,
         "CHAR" | "CHARACTER" => Type::BPCHAR,
         "CLOB" => Type::TEXT,
         "DATE" => Type::DATE,
@@ -4789,7 +4936,7 @@ fn compute_schema(conn: &Connection) -> Result<Schema, Box<SchemaError>> {
     parse_sql(&dump)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum ParamKind<'a> {
     Named(&'a str),
     Positional,
@@ -4861,6 +5008,42 @@ fn handle_lhs_rhs<'stmt>(
     }
 }
 
+fn is_timestamp_col(col_name: &str, source: Option<&str>) -> bool {
+    if let Some(src) = source {
+        if src.eq_ignore_ascii_case("DATETIME")
+            || src.eq_ignore_ascii_case("TIMESTAMP")
+            || src.eq_ignore_ascii_case("DATE")
+            || src.eq_ignore_ascii_case("TIME")
+        {
+            return true;
+        }
+    }
+    let lower = col_name.to_ascii_lowercase();
+    lower.ends_with("_time")
+        || lower.ends_with("_at")
+        || lower.ends_with("_date")
+        || lower == "start_time"
+        || lower == "end_time"
+        || lower == "created_time"
+        || lower == "updated_time"
+        || lower == "expires_at"
+}
+
+fn resolve_col_type<'a>(col_name: &str, col_opt: Option<&'a Column>) -> (SqliteType, Option<&'a str>) {
+    if let Some(col) = col_opt {
+        let (st, src) = col.sql_type();
+        if st != SqliteType::Integer && is_timestamp_col(col_name, src) {
+            (SqliteType::Numeric, Some("DATETIME"))
+        } else {
+            (st, src)
+        }
+    } else if is_timestamp_col(col_name, None) {
+        (SqliteType::Numeric, Some("DATETIME"))
+    } else {
+        (SqliteType::Text, None)
+    }
+}
+
 fn extract_params<'schema, 'stmt>(
     schema: &'schema Schema,
     expr: &'stmt Expr,
@@ -4882,39 +5065,81 @@ fn extract_params<'schema, 'stmt>(
                 match name {
                     // not aliased!
                     SqliteName::Id(id) => {
-                        // find the first one to match
+                        let col_name = rem_first_and_last(&id.0);
+                        let mut found = false;
                         for (_, table) in tables.iter() {
-                            if let Some(col) = table.columns.get(&id.0) {
-                                let (sqlite_type, source) = col.sql_type();
+                            let col = table.columns.get(col_name)
+                                .or_else(|| table.columns.iter().find(|(k, _)| k.eq_ignore_ascii_case(col_name)).map(|(_, v)| v));
+                            if let Some(col) = col {
+                                let (sqlite_type, source) = resolve_col_type(col_name, Some(col));
                                 params.insert(Param {
                                     kind,
                                     sqlite_type,
                                     source,
                                 });
+                                found = true;
                                 break;
                             }
                         }
+                        if !found {
+                            let (sqlite_type, source) = resolve_col_type(col_name, None);
+                            params.insert(Param {
+                                kind,
+                                sqlite_type,
+                                source,
+                            });
+                        }
                     }
-                    SqliteName::Name(_) => {}
-                    SqliteName::Qualified(tbl_name, col_name)
-                    | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
-                        trace!("looking tbl {} for col {}", tbl_name.0, col_name.0);
-                        if let Some(table) = tables.get(&tbl_name.0) {
-                            trace!("found table! {}", table.name);
-                            let col_name = if col_name.0.starts_with('"') {
-                                rem_first_and_last(&col_name.0)
-                            } else {
-                                &col_name.0
-                            };
-
-                            if let Some(col) = table.columns.get(col_name) {
-                                let (sqlite_type, source) = col.sql_type();
+                    SqliteName::Name(name) => {
+                        let col_name = rem_first_and_last(&name.0);
+                        let mut found = false;
+                        for (_, table) in tables.iter() {
+                            let col = table.columns.get(col_name)
+                                .or_else(|| table.columns.iter().find(|(k, _)| k.eq_ignore_ascii_case(col_name)).map(|(_, v)| v));
+                            if let Some(col) = col {
+                                let (sqlite_type, source) = resolve_col_type(col_name, Some(col));
                                 params.insert(Param {
                                     kind,
                                     sqlite_type,
                                     source,
                                 });
+                                found = true;
+                                break;
                             }
+                        }
+                        if !found {
+                            let (sqlite_type, source) = resolve_col_type(col_name, None);
+                            params.insert(Param {
+                                kind,
+                                sqlite_type,
+                                source,
+                            });
+                        }
+                    }
+                    SqliteName::Qualified(tbl_name, col_name)
+                    | SqliteName::DoublyQualified(_, tbl_name, col_name) => {
+                        let tbl_name = rem_first_and_last(&tbl_name.0);
+                        let col_name = rem_first_and_last(&col_name.0);
+                        trace!("looking tbl {} for col {}", tbl_name, col_name);
+                        let table = tables.get(tbl_name).copied()
+                            .or_else(|| tables.iter().find(|(k, _)| k.eq_ignore_ascii_case(tbl_name)).map(|(_, v)| *v));
+                        if let Some(table) = table {
+                            trace!("found table! {}", table.name);
+                            let col = table.columns.get(col_name)
+                                .or_else(|| table.columns.iter().find(|(k, _)| k.eq_ignore_ascii_case(col_name)).map(|(_, v)| v));
+                            let (sqlite_type, source) = resolve_col_type(col_name, col);
+                            params.insert(Param {
+                                kind,
+                                sqlite_type,
+                                source,
+                            });
+                        } else {
+                            let (sqlite_type, source) = resolve_col_type(col_name, None);
+                            params.insert(Param {
+                                kind,
+                                sqlite_type,
+                                source,
+                            });
                         }
                     }
                 }
@@ -4933,12 +5158,16 @@ fn extract_params<'schema, 'stmt>(
 
         // CAST ( expr AS type-name )
         Expr::Cast {
-            expr: _,
+            expr,
             type_name: _,
-        } => {}
+        } => {
+            extract_params(schema, expr, tables, params)?;
+        }
 
         // expr COLLATE collation-name
-        Expr::Collate(_, _) => {}
+        Expr::Collate(expr, _) => {
+            extract_params(schema, expr, tables, params)?;
+        }
 
         // schema-name.table-name.column-name
         Expr::DoublyQualified(_, _, _) => {}
@@ -5039,12 +5268,15 @@ fn extract_params<'schema, 'stmt>(
 
         // expr [NOT] LIKE | GLOB | REGEXP | MATCH expr
         Expr::Like {
-            lhs: _,
+            lhs,
             not: _,
             op: _,
-            rhs: _,
+            rhs,
             escape: _,
-        } => {}
+        } => {
+            extract_params(schema, lhs, tables, params)?;
+            extract_params(schema, rhs, tables, params)?;
+        }
 
         // NULL | integer | float | text | blob
         Expr::Literal(_) => {
@@ -5074,19 +5306,38 @@ fn extract_params<'schema, 'stmt>(
         Expr::Subquery(select) => handle_select(schema, select, params)?,
 
         // NOT | ~ | - | + expr
-        Expr::Unary(_, _) => {}
+        Expr::Unary(_, expr) => {
+            extract_params(schema, expr, tables, params)?;
+        }
 
         // ? | $ | :
-        Expr::Variable(_) => {}
+        Expr::Variable(_) => {
+            if let Some(kind) = as_param(expr) {
+                params.insert(Param {
+                    kind,
+                    sqlite_type: SqliteType::Text,
+                    source: None,
+                });
+            }
+        }
     }
     Ok(())
 }
 
 fn rem_first_and_last(value: &str) -> &str {
-    let mut chars = value.chars();
-    chars.next();
-    chars.next_back();
-    chars.as_str()
+    let s = value.trim();
+    if (s.starts_with('"') && s.ends_with('"'))
+        || (s.starts_with('`') && s.ends_with('`'))
+        || (s.starts_with('\'') && s.ends_with('\''))
+    {
+        if s.len() >= 2 {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    } else {
+        s
+    }
 }
 
 fn handle_select<'schema, 'stmt>(
@@ -5407,11 +5658,12 @@ fn parameter_types<'schema, 'stmt>(
                 }
 
                 let mut tables = HashMap::new();
-                if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
+                let actual_tbl_name = rem_first_and_last(&tbl_name.name.0);
+                if let Some(tbl) = schema.tables.get(actual_tbl_name) {
                     if let Some(alias) = &tbl_name.alias {
-                        tables.insert(alias.0.clone(), tbl);
+                        tables.insert(rem_first_and_last(&alias.0).to_string(), tbl);
                     } else {
-                        tables.insert(tbl_name.name.0.clone(), tbl);
+                        tables.insert(actual_tbl_name.to_string(), tbl);
                     }
                 }
                 if let Some(where_clause) = where_clause {
@@ -5436,39 +5688,47 @@ fn parameter_types<'schema, 'stmt>(
                     handle_with(schema, with, &mut params)?;
                 }
 
-                if let Some(table) = schema.tables.get(&tbl_name.name.0) {
-                    match body {
-                        InsertBody::Select(select, _) => {
-                            if let OneSelect::Values(values_values) = &select.body.select {
-                                for values in values_values.iter() {
-                                    for (i, expr) in values.iter().enumerate() {
-                                        if let Some(kind) = as_param(expr) {
-                                            // specified columns
-                                            let col = if let Some(columns) = columns {
-                                                columns
-                                                    .get(i)
-                                                    .and_then(|name| table.columns.get(&name.0))
-                                            } else {
-                                                table.columns.get_index(i).map(|(_name, col)| col)
-                                            };
-                                            if let Some(col) = col {
-                                                let (sqlite_type, source) = col.sql_type();
-                                                params.insert(Param {
-                                                    kind,
-                                                    sqlite_type,
-                                                    source,
-                                                });
-                                            }
-                                        }
+                let actual_tbl_name = rem_first_and_last(&tbl_name.name.0);
+                let table = schema.tables.get(actual_tbl_name)
+                    .or_else(|| schema.tables.iter().find(|(k, _)| k.eq_ignore_ascii_case(actual_tbl_name)).map(|(_, v)| v));
+
+                match body {
+                    InsertBody::Select(select, _) => {
+                        if let OneSelect::Values(values_values) = &select.body.select {
+                            for values in values_values.iter() {
+                                for (i, expr) in values.iter().enumerate() {
+                                    if let Some(kind) = as_param(expr) {
+                                        // specified columns
+                                        let (col_name_str, col) = if let Some(columns) = columns {
+                                            let cn = columns.get(i).map(|name| rem_first_and_last(&name.0));
+                                            let col = cn.and_then(|cn| {
+                                                table.and_then(|table| {
+                                                    table.columns.get(cn)
+                                                        .or_else(|| table.columns.iter().find(|(k, _)| k.eq_ignore_ascii_case(cn)).map(|(_, v)| v))
+                                                })
+                                            });
+                                            (cn.unwrap_or(""), col)
+                                        } else {
+                                            let col_pair = table.and_then(|table| table.columns.get_index(i));
+                                            let cn = col_pair.map(|(name, _)| name.as_str()).unwrap_or("");
+                                            let col = col_pair.map(|(_, col)| col);
+                                            (cn, col)
+                                        };
+                                        let (sqlite_type, source) = resolve_col_type(col_name_str, col);
+                                        params.insert(Param {
+                                            kind,
+                                            sqlite_type,
+                                            source,
+                                        });
                                     }
                                 }
-                            } else {
-                                handle_select(schema, select, &mut params)?
                             }
+                        } else {
+                            handle_select(schema, select, &mut params)?
                         }
-                        InsertBody::DefaultValues => {
-                            // nothing to do!
-                        }
+                    }
+                    InsertBody::DefaultValues => {
+                        // nothing to do!
                     }
                 }
             }
@@ -5490,9 +5750,11 @@ fn parameter_types<'schema, 'stmt>(
                 }
 
                 let mut tables: HashMap<String, &'schema Table> = Default::default();
-
-                let table = if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
-                    tables.insert(tbl_name.name.0.clone(), tbl);
+                let actual_tbl_name = rem_first_and_last(&tbl_name.name.0);
+                let table = if let Some(tbl) = schema.tables.get(actual_tbl_name)
+                    .or_else(|| schema.tables.iter().find(|(k, _)| k.eq_ignore_ascii_case(actual_tbl_name)).map(|(_, v)| v))
+                {
+                    tables.insert(actual_tbl_name.to_string(), tbl);
                     Some(tbl)
                 } else {
                     None
@@ -5500,14 +5762,16 @@ fn parameter_types<'schema, 'stmt>(
 
                 for set in sets.iter() {
                     if let Some(kind) = as_param(&set.expr) {
-                        let (sqlite_type, source) = if let Some(col) =
-                            set.col_names.first().and_then(|first_col_name| {
-                                table.and_then(|table| table.columns.get(&first_col_name.0))
-                            }) {
-                            col.sql_type()
+                        let col_name_str = set.col_names.first().map(|first_col_name| rem_first_and_last(&first_col_name.0)).unwrap_or("");
+                        let col = if !col_name_str.is_empty() {
+                            table.and_then(|table| {
+                                table.columns.get(col_name_str)
+                                    .or_else(|| table.columns.iter().find(|(k, _)| k.eq_ignore_ascii_case(col_name_str)).map(|(_, v)| v))
+                            })
                         } else {
-                            (SqliteType::Text, None)
+                            None
                         };
+                        let (sqlite_type, source) = resolve_col_type(col_name_str, col);
                         params.insert(Param {
                             kind,
                             sqlite_type,

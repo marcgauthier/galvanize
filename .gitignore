@@ -1,4 +1,4 @@
-/target
+target/
 /schema
 /config.toml
 /data
@@ -13,3 +13,4 @@ benchmark_results/*
 /tests-live/*/runtime
 __pycache__/
 *.pyc
+.pytest_cache/

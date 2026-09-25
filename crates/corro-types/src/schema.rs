@@ -761,7 +761,16 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<Sch
                         unquote(tbl_name.0.as_str()).unwrap_or_else(|_| tbl_name.0.clone());
                     let idx_name = unquote(idx_name.name.0.as_str())
                         .unwrap_or_else(|_| idx_name.name.0.clone());
-                    if let Some(table) = schema.tables.get_mut(tbl_name.as_str()) {
+                    let table_opt = if schema.tables.contains_key(tbl_name.as_str()) {
+                        schema.tables.get_mut(tbl_name.as_str())
+                    } else {
+                        schema
+                            .tables
+                            .iter_mut()
+                            .find(|(k, _)| k.eq_ignore_ascii_case(tbl_name.as_str()))
+                            .map(|(_, v)| v)
+                    };
+                    if let Some(table) = table_opt {
                         table.indexes.insert(
                             idx_name.clone(),
                             Index {
@@ -951,9 +960,9 @@ fn prepare_table(
                 });
                 let nullable = !not_nullable;
 
-                let primary_key = pk.contains(&def.col_name.0);
-
                 let col_name = unquote(&def.col_name.0).unwrap_or_else(|_| def.col_name.0.clone());
+
+                let primary_key = pk.contains(&col_name);
 
                 (
                     col_name.clone(),
