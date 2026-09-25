@@ -8,12 +8,14 @@ base=${GALVANIZE_GO_CLIENT_BASE_PORT:-45430}
 timeout=${GALVANIZE_LIVE_TIMEOUT_SECONDS:-30}
 [[ -x "$binary" ]] || { echo "build first: cargo build -p corrosion --bin galvanize" >&2; exit 2; }
 command -v openssl >/dev/null && command -v go >/dev/null && command -v curl >/dev/null
-mkdir -p "$runtime/node-a/schema" "$runtime/node-a/logs" "$runtime/staging"
+mkdir -p "$runtime/node-a/schema" "$runtime/node-a/logs" "$runtime/node-b/schema" "$runtime/node-b/logs" "$runtime/staging"
 node="$runtime/node-a"
 pid=''
+high_pid=''
 cleanup() {
   local status=$?
   if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; kill -9 "$pid" 2>/dev/null || true; fi
+  if [[ -n "$high_pid" ]]; then kill "$high_pid" 2>/dev/null || true; wait "$high_pid" 2>/dev/null || true; kill -9 "$high_pid" 2>/dev/null || true; fi
   if (( status != 0 )); then
     local failed="$root/tests-live/failures/$(date -u +%Y%m%dT%H%M%SZ)-go-client"
     mkdir -p "$(dirname "$failed")"
@@ -42,9 +44,12 @@ for identity in server client; do
   fi
 done
 export GALV_TEST_DB_KEY=$(openssl rand -hex 32)
+export GALV_TEST_HIGH_DB_KEY=$(openssl rand -hex 32)
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$runtime/recipient.key" 2>/dev/null
 export GALV_TEST_RSA_PUB=$(openssl pkey -in "$runtime/recipient.key" -pubout 2>/dev/null)
+export GALV_TEST_RSA_PRIV=$(<"$runtime/recipient.key")
 export GALV_TEST_ED25519_KEY=$(openssl rand -hex 32)
+export GALV_TEST_PERMITTED_SENDER=$(python3 -c 'import sys; from cryptography.hazmat.primitives.asymmetric import ed25519; print(ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(sys.argv[1])).public_key().public_bytes_raw().hex())' "$GALV_TEST_ED25519_KEY")
 export GALV_ADMIN_SERVER_CERT=$(<"$runtime/server.pem")
 export GALV_ADMIN_SERVER_KEY=$(<"$runtime/server.key")
 export GALV_ADMIN_CLIENT_CA=$(<"$runtime/ca.pem")
@@ -67,7 +72,7 @@ bootstrap = []
 plaintext = true
 allow-list = ["*"]
 [admin]
-uds-path = "$node/admin.sock"
+uds_path = "$node/admin.sock"
 [admin.control-api]
 addr = "127.0.0.1:$((base + 300))"
 server-cert-env = "GALV_ADMIN_SERVER_CERT"
@@ -84,7 +89,7 @@ endpoint = "$runtime/staging"
 [highlow.low]
 stream-id = "go-client-test"
 network-name = "go-client-test"
-upload-interval-seconds = 3600
+upload-interval-seconds = 1
 recipient-key-id = "go-client-test-key"
 recipient-rsa-public-key-env = "GALV_TEST_RSA_PUB"
 sender-signing-key-env = "GALV_TEST_ED25519_KEY"
@@ -94,17 +99,67 @@ server-cert-env = "GALV_CONTROL_SERVER_CERT"
 server-key-env = "GALV_CONTROL_SERVER_KEY"
 client-ca-cert-env = "GALV_CONTROL_CLIENT_CA"
 EOF
+high_node="$runtime/node-b"
+cp "$node/schema/live.sql" "$high_node/schema/live.sql"
+cat >"$high_node/config.toml" <<EOF
+[db]
+path = "$high_node/galvanize.db"
+schema_paths = ["$high_node/schema"]
+await-unlock = true
+[api]
+addr = "127.0.0.1:$((base + 101))"
+[[api.pg]]
+addr = "127.0.0.1:$((base + 1))"
+[gossip]
+addr = "127.0.0.1:$((base + 201))"
+client_addr_v4 = "127.0.0.1:0"
+bootstrap = []
+plaintext = true
+allow-list = ["*"]
+[admin]
+uds_path = "$high_node/admin.sock"
+[files]
+accept-uploads = true
+accept-from-peers = true
+[highlow]
+enabled = true
+[highlow.transport]
+kind = "directory"
+endpoint = "$runtime/staging"
+[highlow.high]
+accepted-streams = ["go-client-test"]
+download-interval-seconds = 1
+recipient-key-id = "go-client-test-key"
+recipient-rsa-private-key-env = "GALV_TEST_RSA_PRIV"
+permitted-sender-key-envs = ["GALV_TEST_PERMITTED_SENDER"]
+[highlow.control-api]
+addr = "127.0.0.1:$((base + 302))"
+server-cert-env = "GALV_CONTROL_SERVER_CERT"
+server-key-env = "GALV_CONTROL_SERVER_KEY"
+client-ca-cert-env = "GALV_CONTROL_CLIENT_CA"
+EOF
 RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info}" "$binary" --config "$node/config.toml" agent >"$node/logs/agent.log" 2>&1 &
 pid=$!
+RUST_LOG="${GALVANIZE_LIVE_RUST_LOG:-info}" "$binary" --config "$high_node/config.toml" agent >"$high_node/logs/agent.log" 2>&1 &
+high_pid=$!
 deadline=$((SECONDS + timeout))
 until curl -fsS "http://127.0.0.1:$((base + 100))/v1/health" >/dev/null 2>&1; do
   (( SECONDS < deadline )) || { echo "public API did not become ready" >&2; exit 1; }
   sleep 0.2
 done
+until curl -fsS "http://127.0.0.1:$((base + 101))/v1/health" >/dev/null 2>&1; do
+  (( SECONDS < deadline )) || { echo "High public API did not become ready" >&2; exit 1; }
+  sleep 0.2
+done
 export GALVANIZE_TEST_API_URL="http://127.0.0.1:$((base + 100))"
+export GALVANIZE_TEST_HIGH_API_URL="http://127.0.0.1:$((base + 101))"
+export GALVANIZE_TEST_HIGH_HIGHLOW_URL="https://127.0.0.1:$((base + 302))"
+export GALVANIZE_TEST_HIGH_PG_DSN="postgres://postgres@127.0.0.1:$((base + 1))/postgres?sslmode=disable"
 export GALVANIZE_TEST_ADMIN_URL="https://127.0.0.1:$((base + 300))"
 export GALVANIZE_TEST_HIGHLOW_URL="https://127.0.0.1:$((base + 301))"
 export GALVANIZE_TEST_PG_DSN="postgres://postgres@127.0.0.1:$base/postgres?sslmode=disable"
+export GALVANIZE_TEST_BIN="$binary"
+export GALVANIZE_TEST_CONFIG="$node/config.toml"
 export GALVANIZE_TEST_TLS_CA="$runtime/ca.pem"
 export GALVANIZE_TEST_TLS_CERT="$runtime/client.pem"
 export GALVANIZE_TEST_TLS_KEY="$runtime/client.key"

@@ -150,3 +150,7 @@ GALVANIZE is a fork of `superfly/corrosion` that adds encryption at rest using S
 - **Files:** `Cargo.toml`, `crates/corro-admin/Cargo.toml`, `crates/corro-types/src/config.rs`, `crates/corro-admin/src/lib.rs`, `crates/corrosion/src/command/agent.rs`, and `crates/corrosion/src/command/reload.rs`.
 - **Behavior:** Adds an optional dedicated mTLS HTTPS listener for forwarding remote admin commands through the existing Unix-socket protocol. The listener requires server cert/key and client CA PEM values supplied by named environment variables.
 - **Client:** `clients/go` adds the `database/sql` PostgreSQL-wire client and Go APIs for public HTTP, High/Low mTLS, and remote admin operations.
+
+### 16. Admin Configuration Aliases and Subscription Attachment
+- **Files:** `crates/corro-types/src/config.rs` and `crates/corro-types/src/pubsub.rs`.
+- **Behavior:** Accepts `uds-path` and `control-api` spellings in admin configuration. Attaches the subscription state database with an explicit empty SQLite3MC key so the unencrypted auxiliary database remains readable when the primary database uses encryption.

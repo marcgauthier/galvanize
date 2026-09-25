@@ -45,8 +45,46 @@ operations, High/Low status/replay/provenance, and every existing admin-socket c
 uses schema files already configured on the node; this API does not upload schema
 files or provide local backup/restore operations.
 
-For bound blobs in HTTP SQL statements, use `galvanize.Blob` so bytes use the
-integer-array representation expected by the API.
+For application SQL, use `OpenSQLFromEnv` and the PostgreSQL wire listener.
+The HTTP `Query` and `Transaction` methods remain available for advanced API
+workflows. For bound blobs in HTTP SQL statements, raw `[]byte` and
+`galvanize.Blob` use the integer-array representation expected by the API.
+
+Stream events expose legacy `Values` (JSON numbers as `float64`) and
+`ValueJSON(index)` for lossless access to large integers. `HasChangeID`
+distinguishes an absent end-of-query watermark from a present zero.
+
+Typed methods cover health, table stats, file upload/search/metadata/stats,
+High/Low status/replay/provenance, and unlock. Existing raw JSON methods remain
+available. Deprecated response aliases are populated for a transition release.
+`ListFiles(ctx, 0, 0)` uses the server's default page size. Use
+`UploadFileWithMetadata` to attach JSON metadata to encrypted files.
+
+`TLSConfig` is the common TLS identity. Set `AdminTLSConfig` and
+`HighLowTLSConfig` when control listeners require different client certificates
+or trust roots. These configurations are cloned. A custom `HTTPClient` supplies
+all transport behavior itself and cannot be combined with TLS config fields.
+The client refuses HTTPS redirects to cleartext URLs.
+
+## Local operations
+
+`LocalCLI` runs the installed `galvanize` binary with argument vectors and a
+context. Set `BinaryPath` explicitly and use `ConfigPath` for node operations.
+Set `WorkingDir` when a CLI operation creates relative paths, such as TLS
+certificate generation.
+Its methods cover agent startup, backup, restore, offline rekey, Consul sync,
+templates, TLS certificate generation, database locking, and change sampling.
+`Run` exposes other current and future CLI subcommands; remote admin operations
+are available through `RunAdminCommand`. SQL application code should use the
+PostgreSQL wire listener. `Rekey` accepts key environment variable names only
+and requires the new key variable to be set in the process environment.
+
+```go
+cli := galvanize.LocalCLI{BinaryPath: "/opt/galvanize/bin/galvanize", ConfigPath: "/etc/galvanize/config.toml"}
+err := cli.Backup(ctx, "/var/backups/galvanize.db")
+```
 
 Run package tests with `go test ./...` from this directory. See
-`../../tests-live/go-client/README.md` for the live scenario.
+`../../tests-live/go-client/README.md` for the live scenario. Run
+`go test -run '^$' -bench 'Benchmark(Event|Upload)' -benchmem` to measure client
+decode and bulk upload costs.

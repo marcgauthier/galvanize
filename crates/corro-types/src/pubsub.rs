@@ -1155,7 +1155,7 @@ impl Matcher {
     fn setup(&self, state_conn: &mut Connection) -> Result<(), MatcherError> {
         info!(sub_id = %self.id, "Attaching __corro_sub to state db");
         if let Err(e) = state_conn.execute_batch(&format!(
-            "ATTACH DATABASE {} AS __corro_sub",
+            "ATTACH DATABASE {} AS __corro_sub KEY ''",
             enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
         )) {
             error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");

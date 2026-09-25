@@ -2,10 +2,13 @@ package galvanize
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -49,11 +52,19 @@ func TestLiveNodeSurface(t *testing.T) {
 	publicProxy := httptest.NewTLSServer(httputil.NewSingleHostReverseProxy(publicTarget))
 	defer publicProxy.Close()
 	roots.AddCert(publicProxy.Certificate())
+	highTarget, err := url.Parse(os.Getenv("GALVANIZE_TEST_HIGH_API_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	highProxy := httptest.NewTLSServer(httputil.NewSingleHostReverseProxy(highTarget))
+	defer highProxy.Close()
+	roots.AddCert(highProxy.Certificate())
+	tlsOptions := &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{clientCert}, MinVersion: tls.VersionTLS12}
 	client, err := NewClient(Config{
 		APIURL:     publicProxy.URL,
 		AdminURL:   os.Getenv("GALVANIZE_TEST_ADMIN_URL"),
 		HighLowURL: os.Getenv("GALVANIZE_TEST_HIGHLOW_URL"),
-		TLSConfig:  &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{clientCert}, MinVersion: tls.VersionTLS12},
+		TLSConfig:  tlsOptions,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -62,14 +73,34 @@ func TestLiveNodeSurface(t *testing.T) {
 	if _, err := client.UnlockFromEnv(ctx, "GALV_TEST_DB_KEY", &cipher, nil); err != nil {
 		t.Fatalf("unlock over HTTPS: %v", err)
 	}
+	highClient, err := NewClient(Config{APIURL: highProxy.URL, HighLowURL: os.Getenv("GALVANIZE_TEST_HIGH_HIGHLOW_URL"), TLSConfig: tlsOptions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := highClient.UnlockFromEnv(ctx, "GALV_TEST_HIGH_DB_KEY", &cipher, nil); err != nil {
+		t.Fatalf("High unlock: %v", err)
+	}
+	highDB, err := OpenSQLFromEnv("GALVANIZE_TEST_HIGH_PG_DSN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer highDB.Close()
 	db, err := OpenSQLFromEnv("GALVANIZE_TEST_PG_DSN")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := db.PingContext(ctx); err != nil {
-		t.Fatal(err)
+	var pingErr error
+	for i := 0; i < 50; i++ {
+		if pingErr = db.PingContext(ctx); pingErr == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
+	if pingErr != nil {
+		t.Fatalf("database ping failed: %v", pingErr)
+	}
+
 	// Also verify the SDK refuses to send unlock material to cleartext URLs.
 	cleartextClient, err := NewClient(Config{APIURL: apiURL})
 	if err != nil {
@@ -107,11 +138,12 @@ func TestLiveNodeSurface(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stream, err := client.Subscribe(ctx, SQL("SELECT id, body FROM notes"), SubscribeOptions{SkipRows: true})
+	stream, err := client.Subscribe(ctx, SQL("SELECT id, body FROM notes"), SubscribeOptions{SkipRows: false})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer stream.Close()
+
 	var resumeFrom uint64
 	for {
 		event, err := stream.Next()
@@ -130,11 +162,7 @@ func TestLiveNodeSurface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resumeEvent, err := resumed.Next()
-	if err != nil || resumeEvent.Type != "eoq" {
-		t.Fatalf("resumed subscription event=%+v err=%v", resumeEvent, err)
-	}
-	_ = resumed.Close()
+	defer resumed.Close()
 
 	_, err = client.Transaction(ctx, []Statement{{Query: "INSERT INTO notes(id, body) VALUES(?, ?)", Params: []any{rowID + 1, "from HTTP"}}}, 10)
 	if err != nil {
@@ -149,6 +177,16 @@ func TestLiveNodeSurface(t *testing.T) {
 			break
 		}
 	}
+	for {
+		event, err := resumed.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == "change" && event.Change == "insert" {
+			break
+		}
+	}
+
 	updateEvent, err := updates.Next()
 	if err != nil || updateEvent.Type != "notify" {
 		t.Fatalf("table update event=%+v err=%v", updateEvent, err)
@@ -235,7 +273,28 @@ func TestLiveNodeSurface(t *testing.T) {
 	if err := client.DeleteFile(ctx, chosenUUID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.SyncFiles(ctx); err != nil {
+	// File sync is High-only; the Low fixture must return the documented error.
+	_, err = client.SyncFiles(ctx)
+	var syncErr *APIError
+	if !errors.As(err, &syncErr) || syncErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected Low-role file sync rejection, got %v", err)
+	}
+	fileStats, err := client.FileStatsTyped(ctx)
+	if err != nil || fileStats.LocalCachedFiles > fileStats.TotalFiles {
+		t.Fatalf("typed file stats=%+v err=%v", fileStats, err)
+	}
+	if _, err := client.ListFiles(ctx, 0, 0); err != nil {
+		t.Fatalf("list files: %v", err)
+	}
+	metaUpload, err := client.UploadFileBytesWithMetadata(ctx, "metadata.txt", "text/plain", map[string]string{"source": "go-client"}, []byte("metadata-file"))
+	if err != nil || metaUpload.UUID == "" {
+		t.Fatalf("metadata upload=%+v err=%v", metaUpload, err)
+	}
+	metaResult, err := client.FileMetadataTyped(ctx, metaUpload.UUID)
+	if err != nil || !strings.Contains(string(metaResult.Metadata), "go-client") {
+		t.Fatalf("file metadata=%+v err=%v", metaResult, err)
+	}
+	if err := client.DeleteFile(ctx, metaUpload.UUID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -248,7 +307,7 @@ func TestLiveNodeSurface(t *testing.T) {
 	}
 	// Read-only operational commands demonstrate the other admin response
 	// shapes without mutating cluster membership or process-wide log filters.
-	for _, command := range []AdminCommand{AdminSubscriptionsList(), AdminClusterMembers(), AdminClusterMembershipStates(), AdminPlumtreeStats()} {
+	for _, command := range []AdminCommand{AdminSubscriptionsList(), AdminClusterMembers(), AdminClusterMembershipStates()} {
 		result, err := client.RunAdminCommand(ctx, command)
 		if err != nil {
 			t.Fatalf("admin command %s: %v", command, err)
@@ -257,6 +316,11 @@ func TestLiveNodeSurface(t *testing.T) {
 			t.Fatalf("admin command %s returned no response events", command)
 		}
 	}
+	// Plumtree is not enabled in plaintext gossip mode; verify it returns an AdminCommandError
+	if _, err := client.RunAdminCommand(ctx, AdminPlumtreeStats()); err == nil {
+		t.Fatal("expected Plumtree command to return an error when disabled")
+	}
+
 	if _, err := client.RunAdminCommand(ctx, AdminReloadSchema()); err != nil {
 		t.Fatalf("admin schema reload: %v", err)
 	}
@@ -279,11 +343,16 @@ func TestLiveNodeSurface(t *testing.T) {
 	if err := json.Unmarshal(status, &role); err != nil || role.Role != "low" {
 		t.Fatalf("High/Low status %s: %v", status, err)
 	}
-	if _, err := client.HighLowReplayStatus(ctx); err != nil {
+	typedStatus, err := client.HighLowStatusTyped(ctx)
+	if err != nil || !typedStatus.Enabled || typedStatus.Role != "low" || typedStatus.PendingExportCount == nil {
+		t.Fatalf("typed High/Low status=%+v err=%v", typedStatus, err)
+	}
+	if _, err := client.HighLowReplayStatusTyped(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.ReplayHighLow(ctx, "all", nil); err != nil {
-		t.Fatal(err)
+	job, err := client.ReplayHighLowTyped(ctx, "all", nil)
+	if err != nil || job.JobID == "" || job.Scope != "all" {
+		t.Fatalf("replay job=%+v err=%v", job, err)
 	}
 	// Provenance is HIGH-only. The LOW fixture should reject this request with
 	// 403, proving the mTLS route and role boundary are both being exercised.
@@ -297,4 +366,71 @@ func TestLiveNodeSurface(t *testing.T) {
 	if err := db.QueryRowContext(ctx, "SELECT body FROM notes WHERE id = $1", rowID).Scan(&observed); err != nil || observed != "from database/sql" {
 		t.Fatalf("PostgreSQL wire row=%q err=%v", observed, err)
 	}
+	var highObserved string
+	for ctx.Err() == nil {
+		if err := highDB.QueryRowContext(ctx, "SELECT body FROM notes WHERE id = $1", rowID).Scan(&highObserved); err == nil && highObserved == "from database/sql" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if highObserved != "from database/sql" {
+		t.Fatalf("High did not import Low row: %q, context: %v", highObserved, ctx.Err())
+	}
+	lowDigest, err := notesDigest(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var highDigest [32]byte
+	for ctx.Err() == nil {
+		highDigest, err = notesDigest(ctx, highDB)
+		if err == nil && highDigest == lowDigest {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lowDigest != highDigest {
+		t.Fatalf("Low and High notes differ: %x != %x", lowDigest, highDigest)
+	}
+	provenance, err := highClient.HighLowProvenanceTyped(ctx, []ProvenanceRecord{{Table: "notes", PrimaryKey: map[string]any{"id": rowID}}})
+	if err != nil || len(provenance.Records) != 1 || !provenance.Records[0].LowOrigin {
+		t.Fatalf("High provenance=%+v err=%v", provenance, err)
+	}
+	if _, err := highClient.SyncFilesTyped(ctx); err != nil {
+		t.Fatalf("High file sync: %v", err)
+	}
+	cli := LocalCLI{BinaryPath: os.Getenv("GALVANIZE_TEST_BIN"), ConfigPath: os.Getenv("GALVANIZE_TEST_CONFIG"), Stdout: io.Discard, Stderr: io.Discard}
+	if err := cli.Run(ctx, "cluster", "members"); err != nil {
+		t.Fatalf("local CLI cluster members: %v", err)
+	}
+}
+
+// notesDigest compares application rows over PostgreSQL wire; Low and High
+// maintain different internal journals, so their database files differ by design.
+func notesDigest(ctx context.Context, db *sql.DB) ([32]byte, error) {
+	var empty [32]byte
+	rows, err := db.QueryContext(ctx, "SELECT id, body FROM notes ORDER BY id")
+	if err != nil {
+		return empty, err
+	}
+	defer rows.Close()
+	hash := sha256.New()
+	for rows.Next() {
+		var id int64
+		var body string
+		if err := rows.Scan(&id, &body); err != nil {
+			return empty, err
+		}
+		if _, err := fmt.Fprintf(hash, "%d:%d:%s\n", id, len(body), body); err != nil {
+			return empty, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return empty, err
+	}
+	var result [32]byte
+	copy(result[:], hash.Sum(nil))
+	return result, nil
 }

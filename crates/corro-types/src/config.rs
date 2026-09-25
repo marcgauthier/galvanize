@@ -444,12 +444,13 @@ pub enum OtelConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
-    #[serde(alias = "path")]
+    #[serde(alias = "path", alias = "uds-path")]
     pub uds_path: Utf8PathBuf,
     /// Optional remote operator API. Private TLS material stays in environment variables.
-    #[serde(default)]
+    #[serde(default, alias = "control-api", alias = "control_api")]
     pub control_api: Option<AdminControlApiConfig>,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

@@ -38,14 +38,15 @@ func (r *AdminResponse) UnmarshalJSON(data []byte) error {
 		switch name {
 		case "Log":
 			var value struct {
-				Level     string `json:"level"`
-				Message   string `json:"msg"`
-				Timestamp string `json:"ts"`
+				Level     string          `json:"level"`
+				Message   string          `json:"msg"`
+				Timestamp json.RawMessage `json:"ts"`
 			}
 			if err := json.Unmarshal(raw, &value); err != nil {
 				return err
 			}
-			r.Level, r.Message, r.Timestamp = value.Level, value.Message, value.Timestamp
+			r.Level, r.Message, r.Timestamp = value.Level, value.Message, string(value.Timestamp)
+
 		case "Json":
 			r.Data = append(r.Data[:0], raw...)
 		case "Error":
@@ -146,3 +147,32 @@ func AdminSetLogFilter(filter string) AdminCommand {
 }
 func AdminResetLogFilter() AdminCommand { return adminNested("Log", "Reset", nil) }
 func AdminPlumtreeStats() AdminCommand  { return adminNested("Plumtree", "Stats", nil) }
+
+// Ping checks that the node's admin control listener is reachable and responsive.
+func (c *Client) Ping(ctx context.Context) error {
+	_, err := c.RunAdminCommand(ctx, AdminPing())
+	return err
+}
+
+// ReloadSchema reloads configured schema files on the node without daemon restart.
+func (c *Client) ReloadSchema(ctx context.Context) error {
+	_, err := c.RunAdminCommand(ctx, AdminReloadSchema())
+	return err
+}
+
+// ReloadDictionaries reloads dictionary compression files on the node.
+func (c *Client) ReloadDictionaries(ctx context.Context) error {
+	_, err := c.RunAdminCommand(ctx, AdminReloadDictionaries())
+	return err
+}
+
+// SyncGenerate triggers a manual anti-entropy sync reconciliation across cluster peers.
+func (c *Client) SyncGenerate(ctx context.Context) error {
+	_, err := c.RunAdminCommand(ctx, AdminSyncGenerate())
+	return err
+}
+
+// ClusterMembers returns the list of current cluster mesh peers.
+func (c *Client) ClusterMembers(ctx context.Context) (AdminResult, error) {
+	return c.RunAdminCommand(ctx, AdminClusterMembers())
+}
