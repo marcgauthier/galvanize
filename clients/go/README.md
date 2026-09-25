@@ -40,8 +40,8 @@ client, err := galvanize.NewClient(galvanize.Config{
 `APIURL` may point directly at the public HTTP API or at a TLS-terminating
 reverse proxy. The admin and High/Low control URLs are dedicated mTLS listeners.
 The client exposes query/transaction streams, resumable subscriptions, table
-updates, health, unlock-from-environment, table stats, file operations, High/Low
-status/replay/provenance, and every existing admin-socket command. Schema reload
+updates, health, caller-key and environment-key unlock methods, table stats, file
+operations, High/Low status/replay/provenance, and every existing admin-socket command. Schema reload
 uses schema files already configured on the node; this API does not upload schema
 files or provide local backup/restore operations.
 
