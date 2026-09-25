@@ -408,6 +408,36 @@ func (c *Client) Health(ctx context.Context, thresholds url.Values) (json.RawMes
 	return c.rawJSON(ctx, http.MethodGet, "/v1/health", thresholds, nil, c.apiURL)
 }
 
+// Unlock submits a database key supplied by the caller. It requires HTTPS to
+// avoid sending the key over a clear-text connection.
+func (c *Client) Unlock(ctx context.Context, key string) error {
+	if !strings.HasPrefix(c.apiURL, "https://") {
+		return errors.New("database unlock requires an HTTPS API URL")
+	}
+	if key == "" {
+		return errors.New("database key must not be empty")
+	}
+	err := c.jsonRequest(ctx, http.MethodPost, "/v1/admin/unlock", nil, map[string]any{"key": key}, nil, c.apiURL)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
+		return err
+	}
+	status, healthErr := c.Health(ctx, nil)
+	if healthErr != nil {
+		return healthErr
+	}
+	var response struct {
+		Status string `json:"status"`
+	}
+	if unmarshalErr := json.Unmarshal(status, &response); unmarshalErr != nil {
+		return unmarshalErr
+	}
+	if response.Status != "awaiting_unlock" {
+		return nil
+	}
+	return err
+}
+
 // UnlockFromEnv submits a database key read from the named environment variable.
 // It requires HTTPS to avoid sending the key over a clear-text connection.
 func (c *Client) UnlockFromEnv(ctx context.Context, keyEnv string, cipher, cipherParams *string) (json.RawMessage, error) {

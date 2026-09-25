@@ -101,7 +101,43 @@ func TestUnlockRequiresHTTPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := client.Unlock(context.Background(), "database-key"); err == nil || !strings.Contains(err.Error(), "requires an HTTPS") {
+		t.Fatalf("expected HTTPS requirement, got %v", err)
+	}
 	if _, err := client.UnlockFromEnv(context.Background(), "MISSING_DB_KEY", nil, nil); err == nil || !strings.Contains(err.Error(), "requires an HTTPS") {
 		t.Fatalf("expected HTTPS requirement, got %v", err)
+	}
+}
+
+func TestUnlockUsesCallerKeyAndAcceptsAlreadyUnlockedNode(t *testing.T) {
+	requests := 0
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		switch r.URL.Path {
+		case "/v1/admin/unlock":
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload) != 1 || payload["key"] != "database-key" {
+				t.Errorf("unlock payload = %#v", payload)
+			}
+			return &http.Response{StatusCode: http.StatusConflict, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("already unlocked")), Request: r}, nil
+		case "/v1/health":
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"status":"ready"}`)), Request: r}, nil
+		default:
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			return &http.Response{StatusCode: http.StatusNotFound, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("not found")), Request: r}, nil
+		}
+	})
+	client, err := NewClient(Config{APIURL: "https://db.test", HTTPClient: &http.Client{Transport: transport}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Unlock(context.Background(), "database-key"); err != nil {
+		t.Fatalf("unlock already unlocked node: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("request count = %d, want unlock plus health", requests)
 	}
 }
